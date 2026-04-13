@@ -13,7 +13,7 @@ class CatAlogSettings(BaseModel):
 
 @plugin
 def settings_model():
-    return CatAlogSettings.model_json_schema()
+    return CatAlogSettings
 
 
 @hook(priority=10)
@@ -26,8 +26,7 @@ async def before_rabbithole_splits_documents(docs: List[Document], cat) -> List[
     if not docs:
         return docs
 
-    plugin_obj = cat.mad_hatter.get_plugin()
-    settings = plugin_obj.load_settings() or {}
+    settings = await cat.mad_hatter.get_plugin().load_settings()
     max_summary_chars = int(settings.get("max_summary_chars", 8000))
 
     # The documents at this point are full parsed pages (pre-split).
