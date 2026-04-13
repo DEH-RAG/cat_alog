@@ -49,7 +49,7 @@ async def before_rabbithole_splits_documents(docs: List[Document], cat) -> List[
     )
 
     try:
-        result = await cat.large_language_model.ainvoke(prompt)
+        result = cat.large_language_model.invoke(prompt)
         summary = result.content if hasattr(result, "content") else str(result)
     except Exception as e:
         log.warning(f"cat_alog: failed to summarize '{source}': {e}")
