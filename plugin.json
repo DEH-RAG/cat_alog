@@ -1,0 +1,10 @@
+{
+  "name": "Cat Alog",
+  "description": "Plugin to allow discussing 'about' the loaded files",
+  "author_name": "Andrea Sterbini",
+  "author_url": "https://github.com/asterbini",
+  "plugin_url": "https://github.com/DEH-RAG/cat_alog",
+  "tags": "files, catalog card",
+  "thumb": "",
+  "version": "0.1"
+}
