@@ -6,5 +6,6 @@
   "plugin_url": "https://github.com/DEH-RAG/cat_alog",
   "tags": "files, catalog card",
   "thumb": "",
-  "version": "0.1"
+  "version": "0.1",
+  "dependencies": []
 }

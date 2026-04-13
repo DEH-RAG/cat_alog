@@ -1,1 +1,1 @@
-langchain_core
+langchain-core
