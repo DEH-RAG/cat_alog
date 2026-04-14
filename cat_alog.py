@@ -1,4 +1,5 @@
 from typing import List
+import asyncio
 from pydantic import BaseModel, Field
 from cat import hook, plugin, log
 from langchain_core.documents.base import Document
@@ -18,44 +19,39 @@ def settings_model():
 
 @hook(priority=10)
 async def before_rabbithole_splits_documents(docs: List[Document], cat) -> List[Document]:
-    """
-    Build the catalogue card summary here, while the text is still whole.
-    Store the summary in each document's metadata so the next hook can retrieve it.
-    The catalogue card Document is NOT added here to avoid being chunked.
-    """
     if not docs:
         return docs
 
     settings = await cat.mad_hatter.get_plugin().load_settings()
+    settings = settings or {}
     max_summary_chars = int(settings.get("max_summary_chars", 8000))
 
-    # The documents at this point are full parsed pages (pre-split).
-    # Join them to build a single representative text.
     full_text = "\n\n".join(
-        doc.page_content for doc in docs if doc.page_content.strip()
+        doc.page_content for doc in docs if doc.page_content and doc.page_content.strip()
     )
+
     text_for_summary = full_text[:max_summary_chars]
     if len(full_text) > max_summary_chars:
         text_for_summary += "\n\n[... truncated ...]"
 
     source = docs[0].metadata.get("source", "unknown")
 
-    prompt = (
-        "Write a short summary of the following file. "
-        "Focus on what the file is, what it is about, and what it contains. "
-        "Maximum 200 words.\n\n"
-        f"Filename or source: {source}\n\n"
-        f"{text_for_summary}"
-    )
+    full_prompt = f"""Write a short summary of the following file.
+Focus on what the file is, what it is about, and what it contains.
+Maximum 200 words.
+
+Filename or source: {source}
+
+{text_for_summary}
+"""
 
     try:
-        result = cat.large_language_model.invoke(prompt)
-        summary = result.content if hasattr(result, "content") else str(result)
+        result = await asyncio.to_thread(cat.large_language_model.invoke, full_prompt)
+        summary = getattr(result, "content", str(result))
     except Exception as e:
         log.warning(f"cat_alog: failed to summarize '{source}': {e}")
         summary = "(summary not available)"
 
-    # Stash the summary into each doc's metadata so it survives the split step.
     for doc in docs:
         doc.metadata["_catalogue_summary"] = summary
 
