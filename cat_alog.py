@@ -1,7 +1,6 @@
 from typing import List
-import asyncio
 from pydantic import BaseModel, Field
-from cat import hook, plugin, log
+from cat import hook, plugin, log, AgenticWorkflowTask
 from langchain_core.documents.base import Document
 
 
@@ -30,24 +29,27 @@ async def before_rabbithole_splits_documents(docs: List[Document], cat) -> List[
         doc.page_content for doc in docs if doc.page_content and doc.page_content.strip()
     )
 
-    text_for_summary = full_text[:max_summary_chars]
-    if len(full_text) > max_summary_chars:
-        text_for_summary += "\n\n[... truncated ...]"
-
     source = docs[0].metadata.get("source", "unknown")
 
     full_prompt = f"""Write a short summary of the following file.
 Focus on what the file is, what it is about, and what it contains.
-Maximum 200 words.
+Maximum {max_summary_chars} words.
 
 Filename or source: {source}
 
-{text_for_summary}
+{full_text}
 """
 
     try:
-        result = await asyncio.to_thread(cat.large_language_model.invoke, full_prompt)
-        summary = getattr(result, "content", str(result))
+        agent_input = AgenticWorkflowTask(user_prompt=full_prompt)
+
+        callbacks = await cat.plugin_manager.execute_hook("llm_callbacks", [], caller=cat)
+        summary_agent_output = await cat.agentic_workflow.run(
+            task=agent_input,
+            llm=cat.large_language_model,
+            callbacks=callbacks,
+        )
+        summary = summary_agent_output.output
     except Exception as e:
         log.warning(f"cat_alog: failed to summarize '{source}': {e}")
         summary = "(summary not available)"
