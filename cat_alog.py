@@ -2,7 +2,7 @@ from typing import List
 from pydantic import BaseModel, Field
 from cat import hook, plugin, log, AgenticWorkflowTask
 from langchain_core.documents.base import Document
-import asyncio, inspect
+
 
 class CatAlogSettings(BaseModel):
     max_document_chars: int = Field(
@@ -48,25 +48,12 @@ Filename or source: {source}
 """
 
     try:
-        # 1. Recuperiamo il riferimento
-        llm = cat.large_language_model
-        # 2. Se è un metodo, lo chiamiamo per ottenere l'istanza
-        if callable(llm):
-            llm = llm()
-        # 3. Se chiamandolo ci ha restituito una coroutine (come dimostra l'errore), la attendiamo
-        if inspect.iscoroutine(llm):
-            llm = await llm
-        # 4. Ora 'llm' è finalmente l'istanza vera e propria del modello LangChain!
-        if hasattr(llm, "ainvoke"):
-            # Preferiamo ainvoke se disponibile (più moderno e async-nativo)
-            result = await llm.ainvoke(full_prompt)
-        elif hasattr(llm, "invoke"):
-            result = await asyncio.to_thread(llm.invoke, full_prompt)
-        else:
-            # Estremo fallback per modelli non standard
-            result = await asyncio.to_thread(llm, full_prompt)
-        summary = getattr(result, "content", str(result))
-
+        agent_input = AgenticWorkflowTask(user_prompt=full_prompt)
+        summary_agent_output = await cat.agentic_workflow.run(
+            task=agent_input,
+            llm=cat.large_language_model,
+        )
+        summary = summary_agent_output.output
     except Exception as e:
         log.warning(f"cat_alog: failed to summarize '{source}': {e}")
         summary = "(summary not available)"
