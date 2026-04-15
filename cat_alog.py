@@ -3,7 +3,6 @@ from pydantic import BaseModel, Field
 from cat import hook, plugin, log, AgenticWorkflowTask
 from langchain_core.documents.base import Document
 
-
 class CatAlogSettings(BaseModel):
     max_document_chars: int = Field(
         default=8000,
@@ -19,6 +18,7 @@ class CatAlogSettings(BaseModel):
 def settings_model():
     return CatAlogSettings
 
+CATALOGUES = {}
 
 @hook(priority=10)
 async def before_rabbithole_splits_documents(docs: List[Document], cat) -> List[Document]:
@@ -36,7 +36,9 @@ async def before_rabbithole_splits_documents(docs: List[Document], cat) -> List[
     if len(full_text) > max_document_chars:
         full_text = full_text[:max_document_chars] + ' [truncated] '
 
-    source = docs[0].metadata.get("source", "unknown")
+    metadata = docs[0].metadata
+    source = metadata.get("source",    "unknown")
+    agent  = metadata.get("tenant_id", "unknown")
 
     full_prompt = f"""Write a short summary of the following file.
 Focus on what the file is, what it is about, and what it contains.
@@ -58,38 +60,38 @@ Filename or source: {source}
         log.warning(f"cat_alog: failed to summarize '{source}': {e}")
         summary = "(summary not available)"
 
-    docs[0].metadata["_catalogue_summary"]  = summary
+    if agent not in CATALOGUES:
+        CATALOGUES[agent] = {}
+    CATALOGUES[agent][source] = summary
 
-    log.debug(f"cat_alog: summary stored in metadata for '{source}'")
+    log.info(f"cat_alog: summary stored for '{source}'")
     return docs
 
 
 @hook(priority=10)
 def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Document]:
     """
-    Retrieve the pre-computed summary from metadata and append the catalogue card.
-    This hook is sync because no LLM call is needed here.
+    Retrieve the pre-computed summary from the cat and append the catalogue card.
     """
     if not docs:
         return docs
 
-    # The summary was stashed by the previous hook on the first chunk.
-    # All chunks share the same source so any of them works.
-    metadata = docs[0].metadata
-    if not "_catalogue_summary" in metadata:
-        log.warning("cat_alog: no summary found in metadata, skipping catalogue card.")
+    # Card metadata
+    metadata  = docs[0].metadata
+    source    = metadata.get("source",    "unknown")
+    agent     = metadata.get("tenant_id", "unknown")
+    summary   = CATALOGUES.get(agent, {}).get(source,None)
+    abstract  = docs[0].page_content.strip()
+
+    if not summary:
+        log.warning("cat_alog: no summary found, skipping catalogue card.")
         return docs
 
-    # Clean up the temporary summary
-    summary  = metadata.pop("_catalogue_summary",  None)
-    metadata = metadata.copy()
-    source   = metadata.get("source", "unknown")
-    abstract = docs[0].page_content.strip()
-
+    del CATALOGUES[agent][source]
+    
     card_metadata = {
         **metadata,
         "is_catalogue_card": True,
-        "catalogue_for_source": source,
     }
 
     card = f"""
