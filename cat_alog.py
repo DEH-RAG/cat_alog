@@ -64,7 +64,7 @@ Filename or source: {source}
         CATALOGUES[agent] = {}
     CATALOGUES[agent][source] = summary
 
-    log.info(f"cat_alog: summary stored for '{source}'")
+    log.info(f"cat_alog: summary added for '{source}'")
     return docs
 
 
