@@ -28,7 +28,6 @@ async def before_rabbithole_splits_documents(docs: List[Document], cat) -> List[
     metadata = docs[0].metadata
     if 'source' not in metadata: # XLSX files show no source (WHY?)
         return docs
-    log.info(f"CAT_ALOG: {metadata} CAT: {cat}")
     source = metadata['source']
     agent  = cat.agent_key
     # TODO: use the storage path of the file as key
