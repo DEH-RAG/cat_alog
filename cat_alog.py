@@ -93,19 +93,14 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
         "is_catalogue_card": True,
     }
 
-    card = f"""
-# CATALOGUE CARD
-
-## Source file or URL: {source}
-
-## Initial page
-
-{abstract}
-
-## Summary
-
-{summary}
-"""
+    card = (
+        "\n# CATALOGUE CARD\n\n"
+        f"## Source file or URL: {source}\n\n"
+        "## Initial page\n\n"
+        + abstract + "\n\n"
+        "## Summary\n\n"
+        + summary + "\n"
+    )
 
     log.debug(f"cat_alog: added catalogue card for '{source}'")
     return  docs + [Document(page_content=card, metadata=card_metadata)]
