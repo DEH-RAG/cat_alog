@@ -25,6 +25,10 @@ async def before_rabbithole_splits_documents(docs: List[Document], cat) -> List[
     if not docs:
         return docs
 
+    metadata = docs[0].metadata
+    if 'source' not in metadata: # XLSX files show no source (WHY?)
+        return docs
+
     settings = await cat.mad_hatter.get_plugin().load_settings()
     settings = settings or {}
     max_document_chars = int(settings.get("max_document_chars", 8000))
@@ -36,17 +40,21 @@ async def before_rabbithole_splits_documents(docs: List[Document], cat) -> List[
     if len(full_text) > max_document_chars:
         full_text = full_text[:max_document_chars] + ' [truncated] '
 
-    metadata = docs[0].metadata
-    source = metadata.get("source",    "unknown")
-    agent  = metadata.get("tenant_id", "unknown")
+    source = metadata.get("source",    "unknown source")
+    agent  = metadata.get("tenant_id", "unknown agent")
+
+    safe_text = full_text.replace('{','{{').replace('}','}}')
 
     full_prompt = f"""Write a short summary of the following file.
 Focus on what the file is, what it is about, and what it contains.
 Maximum {max_summary_words} words.
 
-Filename or source: {source}
+## Filename or source: {source}
 
-""" + full_text + "\n" # avoid f-strings because the text could contain culrlies
+## File content
+
+{safe_text}
+"""
 
     try:
         agent_input = AgenticWorkflowTask(user_prompt=full_prompt)
@@ -63,7 +71,7 @@ Filename or source: {source}
         CATALOGUES[agent] = {}
     CATALOGUES[agent][source] = summary
 
-    log.info(f"cat_alog: summary added for '{source}'")
+    log.info(f"cat_alog: summary added for '{source}' [{summary[:100]}...]")
     return docs
 
 
