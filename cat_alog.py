@@ -28,6 +28,10 @@ async def before_rabbithole_splits_documents(docs: List[Document], cat) -> List[
     metadata = docs[0].metadata
     if 'source' not in metadata: # XLSX files show no source (WHY?)
         return docs
+    log.info(f"CAT_ALOG: {metadata} CAT: {cat}")
+    source = metadata['source']
+    agent  = cat.agent_key
+    # TODO: use the storage path of the file as key
 
     settings = await cat.mad_hatter.get_plugin().load_settings()
     settings = settings or {}
@@ -39,9 +43,6 @@ async def before_rabbithole_splits_documents(docs: List[Document], cat) -> List[
     )
     if len(full_text) > max_document_chars:
         full_text = full_text[:max_document_chars] + ' [truncated] '
-
-    source = metadata.get("source",    "unknown source")
-    agent  = metadata.get("tenant_id", "unknown agent")
 
     safe_text = full_text.replace('{','{{').replace('}','}}')
 
@@ -64,14 +65,14 @@ Maximum {max_summary_words} words.
         )
         summary = summary_agent_output.output
     except Exception as e:
-        log.warning(f"cat_alog: failed to summarize '{source}': {e}")
+        log.warning(f"cat_alog: failed to summarize '{agent}/{source}': {e}")
         summary = "(summary not available)"
 
     if agent not in CATALOGUES:
         CATALOGUES[agent] = {}
     CATALOGUES[agent][source] = summary
 
-    log.info(f"cat_alog: summary added for '{source}' [{summary[:100]}...]")
+    log.info(f"cat_alog: summary added for '{agent}/{source}' [{summary[:100]}...]")
     return docs
 
 
@@ -83,15 +84,19 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
     if not docs:
         return docs
 
-    # Card metadata
     metadata  = docs[0].metadata
-    source    = metadata.get("source",    "unknown")
-    agent     = metadata.get("tenant_id", "unknown")
+    if 'source' not in metadata: # XLSX files show no source (WHY?)
+        return docs
+
+    # Card metadata
+    source    = metadata['source']
+    agent     = cat.agent_key
+    # TODO: use the storage path of the file as key
     summary   = CATALOGUES.get(agent, {}).get(source,None)
     abstract  = docs[0].page_content.strip()
 
     if not summary:
-        log.warning("cat_alog: no summary found, skipping catalogue card.")
+        log.warning(f"cat_alog: no summary found for {agent}/{source}, skipping catalogue card.")
         return docs
 
     del CATALOGUES[agent][source]
