@@ -46,8 +46,7 @@ Maximum {max_summary_words} words.
 
 Filename or source: {source}
 
-{full_text}
-"""
+""" + full_text + "\n" # avoid f-strings because the text could contain culrlies
 
     try:
         agent_input = AgenticWorkflowTask(user_prompt=full_prompt)

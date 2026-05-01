@@ -1,1 +1,1 @@
-langchain-core
+langchain-core>=1.3.0
