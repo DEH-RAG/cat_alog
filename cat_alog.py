@@ -1,7 +1,11 @@
-from typing import List
+import threading
+import time
+from collections import OrderedDict
+from typing import List, Tuple, Optional
 from pydantic import BaseModel, Field
 from cat import hook, plugin, log, AgenticWorkflowTask
 from langchain_core.documents.base import Document
+
 
 class CatAlogSettings(BaseModel):
     max_document_chars: int = Field(
@@ -12,13 +16,63 @@ class CatAlogSettings(BaseModel):
         default=200,
         description="Maximum number of words for the summary."
     )
+    cache_ttl_seconds: int = Field(
+        default=3600,
+        description="Time-to-live for cache entries in seconds."
+    )
+    cache_max_size: int = Field(
+        default=100,
+        description="Maximum number of entries in the LRU cache."
+    )
 
 
 @plugin
 def settings_model():
     return CatAlogSettings
 
-CATALOGUES = {}
+
+class TTL_LRU_Cache:
+    def __init__(self, max_size: int = 100, ttl_seconds: int = 3600):
+        self._cache: OrderedDict[Tuple[str, Optional[str], str], Tuple[str, float]] = OrderedDict()
+        self._max_size = max_size
+        self._ttl_seconds = ttl_seconds
+        self._lock = threading.Lock()
+
+    def _make_key(self, agent_id: str, chat_id: Optional[str], filename: str) -> Tuple[str, Optional[str], str]:
+        return (agent_id, chat_id, filename)
+
+    def get(self, agent_id: str, chat_id: Optional[str], filename: str) -> Optional[str]:
+        key = self._make_key(agent_id, chat_id, filename)
+        with self._lock:
+            if key not in self._cache:
+                return None
+            value, timestamp = self._cache[key]
+            if time.time() - timestamp > self._ttl_seconds:
+                del self._cache[key]
+                return None
+            self._cache.move_to_end(key)
+            return value
+        return None
+
+    def set(self, agent_id: str, chat_id: Optional[str], filename: str, summary: str) -> None:
+        key = self._make_key(agent_id, chat_id, filename)
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+            self._cache[key] = (summary, time.time())
+            while len(self._cache) > self._max_size:
+                self._cache.popitem(last=False)
+
+    def delete(self, agent_id: str, chat_id: Optional[str], filename: str) -> bool:
+        key = self._make_key(agent_id, chat_id, filename)
+        with self._lock:
+            if key in self._cache:
+                del self._cache[key]
+                return True
+            return False
+
+
+CATALOGUES = TTL_LRU_Cache()
 
 @hook(priority=10)
 async def before_rabbithole_splits_documents(docs: List[Document], cat) -> List[Document]:
@@ -26,16 +80,21 @@ async def before_rabbithole_splits_documents(docs: List[Document], cat) -> List[
         return docs
 
     metadata = docs[0].metadata
-    if 'source' not in metadata: # XLSX files show no source (WHY?)
+    if 'source' not in metadata:
         return docs
     source = metadata['source']
-    agent  = cat.agent_key
-    # TODO: use the storage path of the file as key
+    agent_id = cat.agent_key
+    chat_id = metadata.get('chat_id', None)
+
+    cached_summary = CATALOGUES.get(agent_id, chat_id, source)
+    if cached_summary is not None:
+        log.info(f"cat_alog: cache hit for '{agent_id}/{chat_id}/{source}'")
+        return docs
 
     settings = await cat.mad_hatter.get_plugin().load_settings()
     settings = settings or {}
     max_document_chars = int(settings.get("max_document_chars", 8000))
-    max_summary_words  = int(settings.get("max_summary_words",   200))
+    max_summary_words = int(settings.get("max_summary_words", 200))
 
     full_text = "\n\n".join(
         doc.page_content for doc in docs if doc.page_content and doc.page_content.strip()
@@ -43,7 +102,7 @@ async def before_rabbithole_splits_documents(docs: List[Document], cat) -> List[
     if len(full_text) > max_document_chars:
         full_text = full_text[:max_document_chars] + ' [truncated] '
 
-    safe_text = full_text.replace('{','{{').replace('}','}}')
+    safe_text = full_text.replace('{', '{{').replace('}', '}}')
 
     full_prompt = f"""Write a short summary of the following file.
 Focus on what the file is, what it is about, and what it contains.
@@ -64,14 +123,12 @@ Maximum {max_summary_words} words.
         )
         summary = summary_agent_output.output
     except Exception as e:
-        log.warning(f"cat_alog: failed to summarize '{agent}/{source}': {e}")
+        log.warning(f"cat_alog: failed to summarize '{agent_id}/{chat_id}/{source}': {e}")
         summary = "(summary not available)"
 
-    if agent not in CATALOGUES:
-        CATALOGUES[agent] = {}
-    CATALOGUES[agent][source] = summary
+    CATALOGUES.set(agent_id, chat_id, source, summary)
 
-    log.info(f"cat_alog: summary added for '{agent}/{source}' [{summary[:100]}...]")
+    log.info(f"cat_alog: summary added for '{agent_id}/{chat_id}/{source}' [{summary[:100]}...]")
     return docs
 
 
@@ -83,23 +140,23 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
     if not docs:
         return docs
 
-    metadata  = docs[0].metadata
-    if 'source' not in metadata: # XLSX files show no source (WHY?)
+    metadata = docs[0].metadata
+    if 'source' not in metadata:
         return docs
 
-    # Card metadata
-    source    = metadata['source']
-    agent     = cat.agent_key
-    # TODO: use the storage path of the file as key
-    summary   = CATALOGUES.get(agent, {}).get(source,None)
-    abstract  = docs[0].page_content.strip()
+    source = metadata['source']
+    agent_id = cat.agent_key
+    chat_id = metadata.get('chat_id', None)
+
+    summary = CATALOGUES.get(agent_id, chat_id, source)
+    abstract = docs[0].page_content.strip()
 
     if not summary:
-        log.warning(f"cat_alog: no summary found for {agent}/{source}, skipping catalogue card.")
+        log.warning(f"cat_alog: no summary found for {agent_id}/{chat_id}/{source}, skipping catalogue card.")
         return docs
 
-    del CATALOGUES[agent][source]
-    
+    CATALOGUES.delete(agent_id, chat_id, source)
+
     card_metadata = {
         **metadata,
         "is_catalogue_card": True,
@@ -115,4 +172,4 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
     )
 
     log.debug(f"cat_alog: added catalogue card for '{source}'")
-    return  docs + [Document(page_content=card, metadata=card_metadata)]
+    return docs + [Document(page_content=card, metadata=card_metadata)]
