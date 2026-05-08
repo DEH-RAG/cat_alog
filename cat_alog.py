@@ -1,9 +1,11 @@
 import threading
 import time
 from collections import OrderedDict
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
+from datetime import datetime
 from pydantic import BaseModel, Field
-from cat import hook, plugin, log, AgenticWorkflowTask
+from cat import hook, plugin, tool, log, AgenticWorkflowTask
+from cat.services.memory.models import VectorMemoryType
 from langchain_core.documents.base import Document
 
 
@@ -173,3 +175,75 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
 
     log.debug(f"cat_alog: added catalogue card for '{source}'")
     return docs + [Document(page_content=card, metadata=card_metadata)]
+
+
+@tool(examples=[
+    "What files are present",
+    "List the files",
+    "Tell me what files you know",
+])
+def list_loaded_files(cat):
+    """List all files loaded in the current conversation and agent with their details.
+
+    Returns a markdown formatted list showing files loaded in the current chat session
+    and at the agent level, with their source, upload date, and content preview.
+    """
+    agent_id = cat.agent_key
+    chat_id = getattr(cat, "id", None)
+
+    output = []
+    output.append("# Loaded Files\n")
+
+    async def _get_files():
+        files_dict: Dict[str, Dict] = {}
+
+        async def add_points_from_collection(collection_name: str, is_episodic: bool):
+            try:
+                points = await cat.vector_memory_handler.recall_tenant_memory(collection_name)
+                for point in points:
+                    doc = point.document
+                    metadata = doc.metadata or {}
+                    source = metadata.get("source", "unknown")
+                    point_chat_id = metadata.get("chat_id")
+
+                    if is_episodic and point_chat_id != chat_id:
+                        continue
+                    if not source or source.startswith("http"):
+                        continue
+
+                    if source not in files_dict:
+                        when_ts = metadata.get("when", 0)
+                        when_str = datetime.fromtimestamp(when_ts).strftime("%Y-%m-%d %H:%M") if when_ts else "unknown"
+                        files_dict[source] = {
+                            "source": source,
+                            "when": when_str,
+                            "content": doc.page_content[:500] if doc.page_content else "",
+                            "type": "conversation" if is_episodic else "agent",
+                        }
+            except Exception as e:
+                log.warning(f"cat_alog: error reading collection {collection_name}: {e}")
+
+        await add_points_from_collection(str(VectorMemoryType.EPISODIC), is_episodic=True)
+        await add_points_from_collection(str(VectorMemoryType.DECLARATIVE), is_episodic=False)
+
+        return files_dict
+
+    import asyncio
+    files_dict = asyncio.run(_get_files())
+
+    if not files_dict:
+        output.append("No files loaded in this conversation or agent.")
+        return "\n".join(output)
+
+    for source, info in sorted(files_dict.items()):
+        file_type = "Chat" if info["type"] == "conversation" else "Agent"
+        content = info["content"]
+        when = info["when"]
+
+        output.append(f"## {source}\n")
+        output.append(f"- **Type**: {file_type}")
+        output.append(f"- **Uploaded**: {when}\n")
+        output.append("**Content preview:**\n")
+        output.append(f"```\n{content}...\n```\n")
+
+    return "\n".join(output)
