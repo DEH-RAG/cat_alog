@@ -85,7 +85,7 @@ async def before_rabbithole_splits_documents(docs: List[Document], cat) -> List[
     metadata = docs[0].metadata
     if 'source' not in metadata:
         return docs
-    source = metadata['source']
+
     agent_id = cat.agent_key
     chat_id = metadata.get('chat_id', None)
 
@@ -143,14 +143,14 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
     if not docs:
         return docs
 
+    metadata = docs[0].metadata
+    if 'source' not in metadata:
+        return docs
+
     # Add positional index to identify the first chunk (chunk_index=0)
     # Only set if not already present (respects prior settings from chunker/plugins).
     for i, doc in enumerate(docs):
         doc.metadata.setdefault("chunk_index", i)
-
-    metadata = docs[0].metadata
-    if 'source' not in metadata:
-        return docs
 
     source = metadata['source']
     agent_id = cat.agent_key
@@ -259,9 +259,9 @@ def list_loaded_files(cat):
                 for record in results:
                     payload = record.payload or {}
                     meta = payload.get("metadata", {}) or {}
-                    source = meta.get("source", "unknown")
+                    source = meta.get("source")
 
-                    if not source or source.startswith("http"):
+                    if not source: # or source.startswith("http"):
                         continue
 
                     point_tenant = meta.get("tenant_id")
@@ -271,6 +271,10 @@ def list_loaded_files(cat):
                     page_content = payload.get("page_content", "") or ""
 
                     if source not in files_dict:
+                        # Only URLs are allowed without a FileManager entry
+                        # (they have no file on disk).
+                        if not source.startswith("http"):
+                            continue
                         when_ts = meta.get("when", 0)
                         when_str = datetime.fromtimestamp(when_ts).strftime("%Y-%m-%d %H:%M") if when_ts else "unknown"
                         files_dict[source] = {
