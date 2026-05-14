@@ -1,6 +1,9 @@
 # .idea project
 .idea/
 
+# opencode
+.sisyphus
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
