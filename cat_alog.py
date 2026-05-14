@@ -86,6 +86,7 @@ async def before_rabbithole_splits_documents(docs: List[Document], cat) -> List[
     if 'source' not in metadata:
         return docs
 
+    source = metadata['source'] 
     agent_id = cat.agent_key
     chat_id = metadata.get('chat_id', None)
 
