@@ -2,7 +2,7 @@ import os
 import threading
 import time
 from collections import OrderedDict
-from typing import List, Tuple, Optional, Dict
+from typing import Any, List, Tuple, Optional, Dict
 from datetime import datetime
 from pydantic import BaseModel, Field
 from cat import hook, plugin, tool, log, AgenticWorkflowTask
@@ -88,7 +88,9 @@ async def before_rabbithole_splits_documents(docs: List[Document], cat) -> List[
 
     source = metadata['source'] 
     agent_id = cat.agent_key
-    chat_id = metadata.get('chat_id', None)
+    # chat_id is not added to metadata until store_documents(); fall back to
+    # cat.id (StrayCat) which is the conversation ID when available.
+    chat_id = metadata.get('chat_id') or getattr(cat, 'id', None)
 
     cached_summary = CATALOGUES.get(agent_id, chat_id, source)
     if cached_summary is not None:
@@ -155,7 +157,7 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
 
     source = metadata['source']
     agent_id = cat.agent_key
-    chat_id = metadata.get('chat_id', None)
+    chat_id = metadata.get('chat_id') or getattr(cat, 'id', None)
 
     summary = CATALOGUES.get(agent_id, chat_id, source)
     abstract = docs[0].page_content.strip()
@@ -202,7 +204,7 @@ def list_loaded_files(cat):
     output.append("# Loaded Files\n")
 
     async def _get_files():
-        files_dict: Dict[str, Dict] = {}
+        files_dict: Dict[str, Dict[str, Any]] = {}
 
         # ──────────────────────────────────────────────
         # PHASE 1: Ground truth from FileManager (fast, no DB)
