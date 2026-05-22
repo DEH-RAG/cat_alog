@@ -347,14 +347,8 @@ def list_loaded_files(cat):
     files_dict = asyncio.run(_get_files())
 
     if not files_dict:
-        log.info("cat_alog: no files found for current agent/conversation")
         output.append("No files loaded in this conversation or agent.")
         return "\n".join(output)
-
-    files = [s for s in files_dict if not s.startswith("http")]
-    urls = [s for s in files_dict if s.startswith("http")]
-    log.info(f"cat_alog: listing {len(files)} files and {len(urls)} URLs")
-    log.debug(f"cat_alog: files={files}  urls={urls}")
 
     for source, info in sorted(files_dict.items()):
         file_type = "Chat" if info["type"] == "conversation" else "Agent"
@@ -382,7 +376,6 @@ def before_cat_sends_message(message, agent_output, cat):
     """Inject known file/URL references into message.why.memory
     so that RITA renders them as downloadable links."""
     if not message.why or not message.text:
-        log.debug("cat_alog: before_cat_sends_message skipped (no why or no text)")
         return message
 
     chat_id = getattr(cat, "id", None)
@@ -393,7 +386,6 @@ def before_cat_sends_message(message, agent_output, cat):
         for f in cat.file_manager.list_files(agent_id):
             known[f.name] = {"chat_id": None}
     except Exception:
-        log.warning("cat_alog: failed to list agent files")
         pass
 
     if chat_id:
@@ -402,24 +394,17 @@ def before_cat_sends_message(message, agent_output, cat):
             for f in cat.file_manager.list_files(conv_path):
                 known[f.name] = {"chat_id": chat_id}
         except Exception:
-            log.warning(f"cat_alog: failed to list conversation files for {chat_id}")
             pass
 
     if not known:
-        log.debug("cat_alog: no known files in agent or conversation, skipping why injection")
         return message
 
     sorted_names = sorted(known.keys(), key=len, reverse=True)
     pattern = "|".join(re.escape(n) for n in sorted_names)
     found = set(re.findall(pattern, message.text))
 
-    log.info(f"cat_alog: why injection — {len(found)}/{len(known)} files matched in message text")
-    log.debug(f"cat_alog: matched files: {sorted(found)}")
-
     for fname in found:
         info = known[fname]
-        chat_label = info["chat_id"] or "agent"
-        log.debug(f"cat_alog: injecting file '{fname}' (scope={chat_label})")
         message.why.memory.append({
             "metadata": {
                 "source": fname,
