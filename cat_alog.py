@@ -377,7 +377,7 @@ def list_loaded_files(cat):
     return "\n".join(output)
 
 
-@hook(priority=0)
+@hook(priority=2)
 def before_cat_sends_message(message, agent_output, cat):
     """Inject known file/URL references into message.why.memory
     so that RITA renders them as downloadable links."""
