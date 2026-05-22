@@ -194,7 +194,7 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
 def list_loaded_files(cat):
     """List all files loaded in the current conversation and agent with their details.
 
-    Returns a markdown formatted list showing files loaded in the current chat session
+    Returns a markdown formatted list showing files/URLs loaded in the current chat session
     and at the agent level, with their source, upload date, and content preview.
     """
     agent_id = cat.agent_key
