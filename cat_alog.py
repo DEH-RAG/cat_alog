@@ -411,23 +411,28 @@ def before_cat_sends_message(message, agent_output, cat):
 
     sorted_names = sorted(known.keys(), key=len, reverse=True)
     pattern = "|".join(re.escape(n) for n in sorted_names)
-    found = set(re.findall(pattern, message.text))
 
-    log.info(f"cat_alog: why injection — {len(found)}/{len(known)} files matched in message text")
-    log.debug(f"cat_alog: matched files: {sorted(found)}")
-
-    for fname in found:
-        info = known[fname]
+    # Single pass: linkify matching file names in text AND inject into why.
+    def linkify_and_inject(m):
+        name = m.group(0)
+        info = known[name]
         chat_label = info["chat_id"] or "agent"
-        log.debug(f"cat_alog: injecting file '{fname}' (scope={chat_label})")
+        log.debug(f"cat_alog: injecting file '{name}' (scope={chat_label})")
         message.why.memory.append({
             "metadata": {
-                "source": fname,
+                "source": name,
                 "chat_id": info["chat_id"],
             },
             "page_content": "",
             "score": 0.0,
-            "id": f"cat_alog_{fname}",
+            "id": f"cat_alog_{name}",
         })
+        return f"[{name}]({name})"
+
+    pre = message.text
+    message.text = re.sub(pattern, linkify_and_inject, message.text)
+    changed = message.text != pre
+    log.info(f"cat_alog: why injection — linkified {len(message.why.memory)} files (text changed={changed})")
+    log.debug(f"cat_alog: injected files: {[m.group(0) for m in re.finditer(pattern, pre)]}")
 
     return message
