@@ -1,5 +1,4 @@
 import os
-import re
 import threading
 import time
 from collections import OrderedDict
@@ -176,7 +175,7 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
 
     card = (
         "\n# CATALOGUE CARD\n\n"
-        f"## Source: [{source}]({source})\n\n"
+        f"## Source file or URL: {source}\n\n"
         "## Initial page\n\n"
         + abstract + "\n\n"
         "## Summary\n\n"
@@ -355,10 +354,7 @@ def list_loaded_files(cat):
         content = info.get("content", "")
         when = info["when"]
 
-        if source.startswith("http"):
-            output.append(f"- URL: [{source}]({source})\n")
-        else:
-            output.append(f"- FILE: [{source}]({source})\n")
+        output.append(f"## FILE NAME: {source}\n")
         output.append(f"- **Type**: {file_type}")
         output.append(f"- **Uploaded**: {when}\n")
 
@@ -369,50 +365,3 @@ def list_loaded_files(cat):
             output.append("**Content preview:** *(not available)*\n")
 
     return "\n".join(output)
-
-
-@hook(priority=2)
-def before_cat_sends_message(message, agent_output, cat):
-    """Inject known file/URL references into message.why.memory
-    so that RITA renders them as downloadable links."""
-    if not message.why or not message.text:
-        return message
-
-    chat_id = getattr(cat, "id", None)
-    agent_id = cat.agent_key
-
-    known = {}
-    try:
-        for f in cat.file_manager.list_files(agent_id):
-            known[f.name] = {"chat_id": None}
-    except Exception:
-        pass
-
-    if chat_id:
-        try:
-            conv_path = os.path.join(agent_id, chat_id)
-            for f in cat.file_manager.list_files(conv_path):
-                known[f.name] = {"chat_id": chat_id}
-        except Exception:
-            pass
-
-    if not known:
-        return message
-
-    sorted_names = sorted(known.keys(), key=len, reverse=True)
-    pattern = "|".join(re.escape(n) for n in sorted_names)
-    found = set(re.findall(pattern, message.text))
-
-    for fname in found:
-        info = known[fname]
-        message.why.memory.append({
-            "metadata": {
-                "source": fname,
-                "chat_id": info["chat_id"],
-            },
-            "page_content": "",
-            "score": 0.0,
-            "id": f"cat_alog_{fname}",
-        })
-
-    return message
