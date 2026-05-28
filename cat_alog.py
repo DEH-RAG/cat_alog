@@ -238,7 +238,8 @@ def list_loaded_files(cat):
 
         # ──────────────────────────────────────────────
         # PHASE 2: Targeted DB queries for content previews
-        #   Two queries per collection: catalogue cards (with summary) + first chunks.
+        #   Query 1: catalogue cards (is_catalogue_card=True) → get the summary.
+        #   Query 2: first chunks (chunk_index=0) → only for sources WITHOUT a card.
         # ──────────────────────────────────────────────
         async def add_db_previews(collection_name: str, is_episodic: bool):
             try:
@@ -246,29 +247,41 @@ def list_loaded_files(cat):
                 meta_filter = {"chat_id": chat_id} if is_episodic else {}
                 scope_type = "conversation" if is_episodic else "agent"
 
-                results = []
-                for filt, label in [
-                    ({**meta_filter, "is_catalogue_card": True}, "catalogue"),
-                    ({**meta_filter, "chunk_index": 0}, "first_chunk"),
-                ]:
-                    try:
-                        records, _ = await handler.get_all_tenant_points(
-                            collection_name, metadata=filt, with_vectors=False,
-                        )
-                        results.extend(records)
-                    except Exception:
-                        log.debug(f"cat_alog: metadata query '{label}' for {collection_name} not supported, skipping")
+                results: List[Any] = []
+                sources_with_cards: set = set()
 
+                # ── Query 1: catalogue cards ──
+                try:
+                    records, _ = await handler.get_all_tenant_points(
+                        collection_name, metadata={**meta_filter, "is_catalogue_card": True}, with_vectors=False,
+                    )
+                    for rec in records:
+                        src = ((rec.payload or {}).get("metadata", {}) or {}).get("source")
+                        if src:
+                            sources_with_cards.add(src)
+                    results.extend(records)
+                except Exception:
+                    log.debug(f"cat_alog: catalogue card query for {collection_name} not supported, skipping")
+
+                # ── Query 2: first chunks (only for sources WITHOUT a card) ──
+                try:
+                    records, _ = await handler.get_all_tenant_points(
+                        collection_name, metadata={**meta_filter, "chunk_index": 0}, with_vectors=False,
+                    )
+                    for rec in records:
+                        src = ((rec.payload or {}).get("metadata", {}) or {}).get("source")
+                        if src and src not in sources_with_cards:
+                            results.append(rec)
+                except Exception:
+                    log.debug(f"cat_alog: first chunk query for {collection_name} not supported, skipping")
+
+                # ── Process results ──
                 for record in results:
                     payload = record.payload or {}
                     meta = payload.get("metadata", {}) or {}
                     source = meta.get("source")
 
-                    if not source: # or source.startswith("http"):
-                        continue
-
-                    point_tenant = meta.get("tenant_id")
-                    if point_tenant is not None and point_tenant != agent_id:
+                    if not source:  # or source.startswith("http"):
                         continue
 
                     page_content = payload.get("page_content", "") or ""
