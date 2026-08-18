@@ -329,20 +329,25 @@ def list_loaded_files(cat):
                     if info["type"] != scope_type:
                         continue
 
-                    try:
-                        records, _ = await handler.get_all_tenant_points(
-                            collection_name,
-                            metadata={**meta_filter, "source": source},
-                            limit=1,
-                            with_vectors=False,
-                        )
-                        if records and records[0].payload:
-                            content = (records[0].payload.get("page_content") or "")[:500]
-                            if content:
-                                files_dict[source]["content"] = content
-                                log.debug(f"cat_alog: legacy fallback found preview for '{source}'")
-                    except Exception:
-                        pass
+                    # Match either by metadata.source (text chunks) or by
+                    # metadata.image_file (images extracted from PDFs store the
+                    # saved image file name there).
+                    for match_key in ("source", "image_file"):
+                        try:
+                            records, _ = await handler.get_all_tenant_points(
+                                collection_name,
+                                metadata={**meta_filter, match_key: source},
+                                limit=1,
+                                with_vectors=False,
+                            )
+                            if records and records[0].payload:
+                                content = (records[0].payload.get("page_content") or "")[:500]
+                                if content:
+                                    files_dict[source]["content"] = content
+                                    log.debug(f"cat_alog: legacy fallback found preview for '{source}' ({match_key})")
+                                    break
+                        except Exception:
+                            pass
             except Exception as e:
                 log.warning(f"cat_alog: error in legacy fallback for {collection_name}: {e}")
 
