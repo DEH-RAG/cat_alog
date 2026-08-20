@@ -168,6 +168,15 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
 
     CATALOGUES.delete(agent_id, chat_id, source)
 
+    card = (
+        "\n# CATALOGUE CARD\n\n"
+        f"## Source file or URL: {source}\n\n"
+        "## Initial page\n\n"
+        + abstract + "\n\n"
+        "## Summary\n\n"
+        + summary + "\n"
+    )
+
     card_metadata = {
         **metadata,
         "is_catalogue_card": True,
@@ -178,15 +187,6 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
         # of the card retrieves the whole card.
         "full_card": card,
     }
-
-    card = (
-        "\n# CATALOGUE CARD\n\n"
-        f"## Source file or URL: {source}\n\n"
-        "## Initial page\n\n"
-        + abstract + "\n\n"
-        "## Summary\n\n"
-        + summary + "\n"
-    )
 
     log.debug(f"cat_alog: added catalogue card for '{source}'")
     return docs + [Document(page_content=card, metadata=card_metadata)]
