@@ -171,6 +171,12 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
     card_metadata = {
         **metadata,
         "is_catalogue_card": True,
+        # Store the FULL card text on every card point. When the card exceeds
+        # the embedder's input window it is split into segments by the core
+        # (each with its own embedding + metadata); with this field every
+        # segment carries the complete card, so any similarity hit on any part
+        # of the card retrieves the whole card.
+        "full_card": card,
     }
 
     card = (
@@ -301,11 +307,23 @@ def list_loaded_files(cat):
                         }
 
                     is_card = meta.get("is_catalogue_card", False)
-                    if is_card and page_content:
-                        summary_marker = "## Summary\n\n"
-                        if summary_marker in page_content:
-                            summary = page_content.split(summary_marker, 1)[1].strip()[:500]
-                            files_dict[source]["content"] = summary
+                    if is_card:
+                        # Prefer the full card stored in metadata: survives card
+                        # splitting (every segment carries it) and is immune to
+                        # the marker landing in a different segment.
+                        full_card = meta.get("full_card", "")
+                        if full_card:
+                            summary_marker = "## Summary\n\n"
+                            if summary_marker in full_card:
+                                summary = full_card.split(summary_marker, 1)[1].strip()[:500]
+                                files_dict[source]["content"] = summary
+                                continue
+                        # fallback: parse the page_content (legacy cards)
+                        if page_content:
+                            summary_marker = "## Summary\n\n"
+                            if summary_marker in page_content:
+                                summary = page_content.split(summary_marker, 1)[1].strip()[:500]
+                                files_dict[source]["content"] = summary
                     elif files_dict[source].get("content") is None:
                         files_dict[source]["content"] = page_content[:500]
             except Exception as e:
