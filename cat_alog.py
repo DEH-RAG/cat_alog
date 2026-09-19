@@ -1,12 +1,15 @@
+import asyncio
+import hashlib
 import os
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from typing import Any, List, Tuple, Optional, Dict
 from datetime import datetime
 from pydantic import BaseModel, Field
 from cat import hook, plugin, tool, log, AgenticWorkflowTask
-from cat.services.memory.models import VectorMemoryType
+from cat.services.memory.models import VectorMemoryType, PointStruct
 from langchain_core.documents.base import Document
 
 
@@ -77,9 +80,223 @@ class TTL_LRU_Cache:
 
 CATALOGUES = TTL_LRU_Cache()
 
+#: Prompt template for the catalogue-card summary. Kept as a module constant
+#: so the settings marker (ingestion_phase_settings_marker) can fingerprint it:
+#: a change to the prompt invalidates previously generated cards.
+_SUMMARY_PROMPT_TEMPLATE = """Write a short summary of the following file.
+Focus on what the file is, what it is about, and what it contains.
+Maximum {max_summary_words} words.
+
+## Filename or source: {source}
+
+## File content
+
+{file_content}
+"""
+
+
+def _phase_machine_active(cat=None) -> bool:
+    """True when the EffING phase machine is deployed and importable.
+
+    When the machine is active the ``catalog_cards`` phase owns card
+    generation and persistence, so the two ``before_rabbithole_*`` hooks
+    become no-ops (the in-memory TTL cache is no longer the persistence).
+    The import is lazy and guarded: with EffING absent this returns False and
+    the legacy hook behavior is kept. Import-safe (no side effects).
+    """
+    try:
+        import cat.plugins.cat_efficient_ingestion  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _build_summary_prompt(source: str, full_text: str, max_summary_words: int) -> str:
+    """Build the LLM summary prompt for ``source`` (shared by hook and phase).
+
+    The file content is brace-escaped so it can be interpolated with
+    ``str.format`` without breaking the template placeholders.
+    """
+    safe_text = full_text.replace("{", "{{").replace("}", "}}")
+    return _SUMMARY_PROMPT_TEMPLATE.format(
+        max_summary_words=max_summary_words,
+        source=source,
+        file_content=safe_text,
+    )
+
+
+async def _run_summary_agent(cat, prompt: str) -> str:
+    """Run the LLM summary agent for ``prompt`` (no exception swallowing).
+
+    The legacy hook wraps this in try/except with a fallback; the
+    ``catalog_cards`` phase lets exceptions propagate (fail-hard -> ERROR).
+    """
+    agent_input = AgenticWorkflowTask(user_prompt=prompt)
+    summary_agent_output = await cat.agentic_workflow.run(
+        task=agent_input,
+        llm=cat.large_language_model,
+    )
+    return summary_agent_output.output
+
+
+def _build_catalogue_card(source: str, metadata: Dict, abstract: str, summary: str) -> Tuple[str, Dict]:
+    """Build the catalogue card text + metadata (shared by hook and phase)."""
+    card = (
+        "\n# CATALOGUE CARD\n\n"
+        f"## Source file or URL: {source}\n\n"
+        "## Initial page\n\n"
+        + abstract + "\n\n"
+        "## Summary\n\n"
+        + summary + "\n"
+    )
+
+    card_metadata = {
+        **metadata,
+        "is_catalogue_card": True,
+        # Store the FULL card text on every card point. When the card exceeds
+        # the embedder's input window it is split into segments by the core
+        # (each with its own embedding + metadata); with this field every
+        # segment carries the complete card, so any similarity hit on any part
+        # of the card retrieves the whole card.
+        "full_card": card,
+    }
+    return card, card_metadata
+
+
+async def _resolve_embedder(cat):
+    """Resolve the active embedder (CheshireCat.lizard or StrayCat.embedder)."""
+    lizard = getattr(cat, "lizard", None)
+    if lizard is not None and hasattr(lizard, "embedder"):
+        return await lizard.embedder()
+    return await cat.embedder()
+
+
+@hook(priority=10)
+def ingestion_phase_specs(specs, cat) -> list:
+    """Accumulator registrant declaring the ``catalog_cards`` phase.
+
+    Appends ``PhaseSpec("catalog_cards", settings_category=None,
+    depends_on=("parsing_chunking", "embedding"))`` so EffING computes
+    staleness for the card phase: it re-runs when the parsing/embedding
+    upstreams re-ran or when the plugin-defined settings marker changed.
+    Lazy-imports ``PhaseSpec``: with EffING absent the specs are returned
+    unchanged (import-safe).
+    """
+    try:
+        from cat.plugins.cat_efficient_ingestion.phases import PhaseSpec
+    except Exception:
+        return specs
+    specs = specs or []
+    specs.append(
+        PhaseSpec(
+            "catalog_cards",
+            settings_category=None,
+            depends_on=("parsing_chunking", "embedding"),
+        )
+    )
+    return specs
+
+
+@hook(priority=10)
+async def ingestion_phase_settings_marker(phase, cat) -> Any:
+    """Material settings marker for the ``catalog_cards`` phase.
+
+    SHA-256 fingerprint of the effective card config (max_document_chars,
+    max_summary_words, cache_ttl_seconds, cache_max_size) plus the summary
+    prompt template: any material change invalidates previously generated
+    cards. ``None`` for unknown phases (conservative stale).
+    """
+    if phase != "catalog_cards":
+        return None
+    settings = await cat.mad_hatter.get_plugin().load_settings()
+    settings = settings or {}
+    config = (
+        int(settings.get("max_document_chars", 8000)),
+        int(settings.get("max_summary_words", 200)),
+        int(settings.get("cache_ttl_seconds", 3600)),
+        int(settings.get("cache_max_size", 100)),
+    )
+    fingerprint_source = repr((config, _SUMMARY_PROMPT_TEMPLATE))
+    return hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()
+
+
+@hook(priority=10)
+async def ingestion_phase_run(phase, source, completed_phases, cat) -> Any:
+    """Run the ``catalog_cards`` phase for ``source`` (tri-state contract).
+
+    - ``{"status": "done"}``: the card was embedded and stored as a vector
+      point with ``is_catalogue_card: True`` + ``full_card`` metadata;
+    - ``{"status": "not_ready", "retry_after": 5}``: the source has no stored
+      points yet (parsing/embedding not done) — retry later;
+    - raise: permanent failure (fail-hard -> ERROR);
+    - ``None`` for unknown phases (fail-hard: a phase nobody implements is an
+      error, never a silent success).
+    """
+    if phase != "catalog_cards":
+        return None
+
+    settings = await cat.mad_hatter.get_plugin().load_settings()
+    settings = settings or {}
+    max_document_chars = int(settings.get("max_document_chars", 8000))
+    max_summary_words = int(settings.get("max_summary_words", 200))
+
+    handler = cat.vector_memory_handler
+    records, _ = await handler.get_all_tenant_points(
+        str(VectorMemoryType.DECLARATIVE),
+        metadata={"source": source},
+        with_vectors=False,
+    )
+
+    # Collect the source's stored chunk texts, excluding any previously
+    # stored catalogue card (a re-run must not summarize its own card).
+    chunks: List[str] = []
+    first_metadata: Dict = {}
+    for rec in records or []:
+        payload = rec.payload or {}
+        meta = payload.get("metadata", {}) or {}
+        if meta.get("is_catalogue_card"):
+            continue
+        content = payload.get("page_content", "") or ""
+        if content.strip():
+            if not chunks:
+                first_metadata = meta
+            chunks.append(content)
+    if not chunks:
+        return {"status": "not_ready", "retry_after": 5}
+
+    full_text = "\n\n".join(chunks)
+    if len(full_text) > max_document_chars:
+        full_text = full_text[:max_document_chars] + " [truncated] "
+
+    prompt = _build_summary_prompt(source, full_text, max_summary_words)
+    summary = await _run_summary_agent(cat, prompt)
+
+    abstract = chunks[0].strip()
+    card, card_metadata = _build_catalogue_card(source, first_metadata, abstract, summary)
+
+    embedder = await _resolve_embedder(cat)
+    vector = (await asyncio.to_thread(embedder.embed_documents, [card]))[0]
+    # Deterministic point id: re-runs upsert the same card instead of
+    # accumulating duplicates (add_points_to_tenant is an upsert).
+    point = PointStruct(
+        id=uuid.uuid5(uuid.NAMESPACE_URL, f"catalogue_card:{source}").hex,
+        payload={"page_content": card, "metadata": card_metadata},
+        vector=vector,
+    )
+    await handler.add_points_to_tenant(str(VectorMemoryType.DECLARATIVE), points=[point])
+
+    log.info(f"cat_alog: catalogue card stored for '{source}'")
+    return {"status": "done"}
+
+
 @hook(priority=10)
 async def before_rabbithole_splits_documents(docs: List[Document], cat) -> List[Document]:
     if not docs:
+        return docs
+
+    # With the EffING phase machine active, the catalog_cards phase owns card
+    # generation: the in-memory TTL cache is no longer the persistence.
+    if _phase_machine_active(cat):
         return docs
 
     metadata = docs[0].metadata
@@ -108,26 +325,10 @@ async def before_rabbithole_splits_documents(docs: List[Document], cat) -> List[
     if len(full_text) > max_document_chars:
         full_text = full_text[:max_document_chars] + ' [truncated] '
 
-    safe_text = full_text.replace('{', '{{').replace('}', '}}')
-
-    full_prompt = f"""Write a short summary of the following file.
-Focus on what the file is, what it is about, and what it contains.
-Maximum {max_summary_words} words.
-
-## Filename or source: {source}
-
-## File content
-
-{safe_text}
-"""
+    full_prompt = _build_summary_prompt(source, full_text, max_summary_words)
 
     try:
-        agent_input = AgenticWorkflowTask(user_prompt=full_prompt)
-        summary_agent_output = await cat.agentic_workflow.run(
-            task=agent_input,
-            llm=cat.large_language_model,
-        )
-        summary = summary_agent_output.output
+        summary = await _run_summary_agent(cat, full_prompt)
     except Exception as e:
         log.warning(f"cat_alog: failed to summarize '{agent_id}/{chat_id}/{source}': {e}")
         summary = "(summary not available)"
@@ -144,6 +345,11 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
     Retrieve the pre-computed summary from the cat and append the catalogue card.
     """
     if not docs:
+        return docs
+
+    # With the EffING phase machine active, the catalog_cards phase owns card
+    # generation and persistence: this hook is a no-op.
+    if _phase_machine_active(cat):
         return docs
 
     metadata = docs[0].metadata
@@ -168,25 +374,7 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
 
     CATALOGUES.delete(agent_id, chat_id, source)
 
-    card = (
-        "\n# CATALOGUE CARD\n\n"
-        f"## Source file or URL: {source}\n\n"
-        "## Initial page\n\n"
-        + abstract + "\n\n"
-        "## Summary\n\n"
-        + summary + "\n"
-    )
-
-    card_metadata = {
-        **metadata,
-        "is_catalogue_card": True,
-        # Store the FULL card text on every card point. When the card exceeds
-        # the embedder's input window it is split into segments by the core
-        # (each with its own embedding + metadata); with this field every
-        # segment carries the complete card, so any similarity hit on any part
-        # of the card retrieves the whole card.
-        "full_card": card,
-    }
+    card, card_metadata = _build_catalogue_card(source, metadata, abstract, summary)
 
     log.debug(f"cat_alog: added catalogue card for '{source}'")
     return docs + [Document(page_content=card, metadata=card_metadata)]
