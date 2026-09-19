@@ -11,7 +11,9 @@ phase-machine guard on the two ``before_rabbithole_*`` hooks:
 - ``ingestion_phase_run`` returns ``not_ready`` when the source has no stored
   points, ``done`` (with a card point stored: ``is_catalogue_card: True`` +
   ``full_card`` metadata) when it has, ``None`` (fail-hard) for unknown
-  phases, and propagates exceptions;
+  phases, and propagates exceptions (including a raising summary agent);
+- ``list_loaded_files`` still works (markdown list with card summary preview)
+  against a fake handler + file manager;
 - ``before_rabbithole_splits_documents`` / ``before_rabbithole_stores_documents``
   are no-ops when the phase machine is importable, and keep the legacy
   behavior (TTL cache + card append) when it is not.
@@ -232,6 +234,10 @@ if __name__ == "__main__":
     m1 = asyncio.run(cat_alog.ingestion_phase_settings_marker("catalog_cards", cat))
     assert isinstance(m1, str) and len(m1) == 64, m1
 
+    # stable for identical settings (deterministic fingerprint)
+    m1_again = asyncio.run(cat_alog.ingestion_phase_settings_marker("catalog_cards", cat))
+    assert m1_again == m1, "marker must be stable for identical settings"
+
     cat2, _ = make_cat({**SETTINGS, "max_summary_words": 300}, [])
     m2 = asyncio.run(cat_alog.ingestion_phase_settings_marker("catalog_cards", cat2))
     assert m1 != m2, "marker must change when the card settings change"
@@ -297,6 +303,21 @@ if __name__ == "__main__":
     else:
         raise AssertionError("ingestion_phase_run must propagate exceptions")
 
+    # 3f. a raising summary agent propagates (fail-hard: the phase path must
+    #     NOT silently fall back to "(summary not available)")
+    class _BoomSummaryAgent:
+        async def run(self, task=None, llm=None):
+            raise RuntimeError("summary agent boom")
+
+    cat_bad_summary = make_cat(SETTINGS, records)[0]
+    cat_bad_summary.agentic_workflow = _BoomSummaryAgent()
+    try:
+        asyncio.run(cat_alog.ingestion_phase_run("catalog_cards", "src", [], cat_bad_summary))
+    except RuntimeError as e:
+        assert "summary agent boom" in str(e), e
+    else:
+        raise AssertionError("a raising summary agent must propagate in the phase path")
+
     # ------------------------------------------------------------------
     # 4. before_rabbithole_* hooks: no-ops while the phase machine is active
     # ------------------------------------------------------------------
@@ -307,7 +328,45 @@ if __name__ == "__main__":
     assert out2 is docs, "stores hook must be a no-op when the phase machine is active"
 
     # ------------------------------------------------------------------
-    # 5. EffING absent: specs no-op, hooks keep the legacy behavior
+    # 5. list_loaded_files tool regression (fake handler + file manager)
+    # ------------------------------------------------------------------
+    class _FakeFileManager:
+        def __init__(self, agent_files, conv_files):
+            self._agent_files = agent_files
+            self._conv_files = conv_files
+
+        def list_files(self, path):
+            if path == "agent":
+                return self._agent_files
+            return self._conv_files
+
+    fm_files = [SimpleNamespace(name="report.pdf", last_modified=1234567890.0)]
+    card_text = (
+        "# CATALOGUE CARD\n\n"
+        "## Source file or URL: report.pdf\n\n"
+        "## Initial page\n\nabstract\n\n"
+        "## Summary\n\nfake summary\n"
+    )
+    card_record = SimpleNamespace(payload={
+        "page_content": card_text,
+        "metadata": {
+            "source": "report.pdf",
+            "is_catalogue_card": True,
+            "full_card": card_text,
+        },
+    })
+    cat_tool, _ = make_cat(SETTINGS, [card_record])
+    cat_tool.file_manager = _FakeFileManager(fm_files, [])
+    listing = cat_alog.list_loaded_files(cat_tool)
+    assert listing.startswith("# Loaded Files"), listing
+    assert "## FILE NAME: report.pdf" in listing, listing
+    assert "**Type**: Agent" in listing, listing
+    assert "**Uploaded**: 1234567890.0" in listing, listing
+    assert "**Content preview:**" in listing, listing
+    assert "fake summary" in listing, listing
+
+    # ------------------------------------------------------------------
+    # 6. EffING absent: specs no-op, hooks keep the legacy behavior
     # ------------------------------------------------------------------
     del sys.modules["cat.plugins.cat_efficient_ingestion.phases"]
     del sys.modules["cat.plugins.cat_efficient_ingestion"]
