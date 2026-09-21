@@ -16,7 +16,14 @@ phase-machine guard on the two ``before_rabbithole_*`` hooks:
   against a fake handler + file manager;
 - ``before_rabbithole_splits_documents`` / ``before_rabbithole_stores_documents``
   are no-ops when the phase machine is importable, and keep the legacy
-  behavior (TTL cache + card append) when it is not.
+  behavior (TTL cache + card append) when it is not;
+- every ``cat.*`` module import and every runtime attribute CATALOG touches
+  on the ``cat`` object resolves against a stub mirroring the UPSTREAM CAT
+  surface (``/root/git/grinning-cat-core`` @ ``feat/efficient-ingestion``),
+  pinned by an AST walk of ``cat_alog.py`` (non-vacuous: removing any
+  referenced name from the stub fails the test). CATALOG does NOT use the
+  factory API nor ``get_agents_main_keys``, so no test-side enumeration shim
+  is needed (unlike EffING).
 
 Runnable:  python test_catalog_phase.py
 Pure-stdlib + unittest.mock, plain asserts, no pytest, no model loading. All
@@ -389,5 +396,101 @@ if __name__ == "__main__":
     assert out2[1].metadata["is_catalogue_card"] is True
     assert "fake summary" in out2[1].page_content
     assert cat_alog.CATALOGUES.get("agent", "chat", "src") is None  # cache consumed
+
+    # ------------------------------------------------------------------
+    # 7. CAT interfaces resolve on the upstream surface (AST-walk)
+    # ------------------------------------------------------------------
+    # Mirrors of the UPSTREAM CAT surface (verified against
+    # /root/git/grinning-cat-core @ feat/efficient-ingestion): the
+    # module-level names cat_alog imports plus the runtime attributes it
+    # touches on the ``cat`` object (CheshireCat/StrayCat/BotMixin).
+    # Upstream differences that hit other plugins do NOT apply here:
+    # CATALOG uses no ServiceFactory API and no ``get_agents_main_keys``
+    # (upstream returns agent ids, MyCAT stripped keys), so no enumeration
+    # shim is required.
+    import ast
+
+    UPSTREAM_MODULE_SURFACE = {
+        "cat": {
+            "hook": None,
+            "plugin": None,
+            "tool": None,
+            "log": None,
+            "AgenticWorkflowTask": None,
+            "services": {
+                "memory": {
+                    "models": {"VectorMemoryType": None, "PointStruct": None},
+                },
+            },
+            "plugins": {
+                "cat_efficient_ingestion": {"phases": {"PhaseSpec": None}},
+            },
+        },
+    }
+    UPSTREAM_CAT_INSTANCE_SURFACE = {
+        "mad_hatter": {"get_plugin": {"load_settings": None}},
+        "agentic_workflow": {"run": None},
+        "large_language_model": None,
+        "vector_memory_handler": {
+            "get_all_tenant_points": None,
+            "add_points_to_tenant": None,
+        },
+        "lizard": {"embedder": None},
+        "embedder": None,
+        "agent_key": None,
+        "id": None,
+        "file_manager": {"list_files": None},
+    }
+
+    def _resolve_chain(tree, chain):
+        node = tree
+        for part in chain:
+            if not isinstance(node, dict) or part not in node:
+                return False
+            node = node[part]
+        return True
+
+    def _collect_cat_references(source_path):
+        with open(source_path) as f:
+            tree = ast.parse(f.read())
+        module_refs = []  # (module path, imported name or None)
+        instance_refs = []  # attribute chain rooted at a `cat` name
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.startswith("cat"):
+                        module_refs.append((alias.name, None))
+            elif isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("cat"):
+                for alias in node.names:
+                    module_refs.append((node.module, alias.asname or alias.name))
+            elif isinstance(node, ast.Attribute):
+                chain = []
+                cur = node
+                while isinstance(cur, ast.Attribute):
+                    chain.append(cur.attr)
+                    cur = cur.value
+                if isinstance(cur, ast.Name) and cur.id == "cat":
+                    instance_refs.append(tuple(reversed(chain)))
+        return module_refs, instance_refs
+
+    module_refs, instance_refs = _collect_cat_references(os.path.join(REPO_ROOT, "cat_alog.py"))
+
+    assert module_refs, "AST walk found no cat.* module references (vacuous test)"
+    assert instance_refs, "AST walk found no cat.* attribute references (vacuous test)"
+
+    for mod, name in module_refs:
+        parts = mod.split(".")
+        assert _resolve_chain(UPSTREAM_MODULE_SURFACE, parts), (
+            f"module '{mod}' does not resolve on the upstream CAT surface"
+        )
+        if name is not None:
+            assert _resolve_chain(UPSTREAM_MODULE_SURFACE, parts + [name]), (
+                f"name '{mod}.{name}' does not resolve on the upstream CAT surface"
+            )
+
+    for chain in instance_refs:
+        assert _resolve_chain(UPSTREAM_CAT_INSTANCE_SURFACE, chain), (
+            f"cat.{'.'.join(chain)} does not resolve on the upstream CAT surface"
+        )
 
     print("test_catalog_phase: ALL ASSERTIONS PASSED")
