@@ -408,8 +408,25 @@ def _format_loaded_files(files_dict, with_previews: bool = False) -> str:
             when = info["when"]
             if isinstance(when, (float, int)):
                 when = datetime.fromtimestamp(when).strftime("%Y-%m-%d %H:%M")
-            elif not isinstance(when, str) and not when:
+            elif not when:
                 when = "unknown"
             pieces.append(f"- **{source}** ({file_type}, uploaded {when})")
 
     return "\n".join(pieces)
+
+
+@hook(priority=10)
+async def agent_prompt_suffix(prompt_suffix: str, cat) -> str:
+    """Append the list of files loaded in the agent and conversation to the end of the system prompt."""
+    try:
+        files = await _collect_loaded_files(cat)
+    except Exception as e:
+        log.warning(f"cat_alog: agent_prompt_suffix could not collect loaded files: {e}")
+        return prompt_suffix
+    if not files:
+        return prompt_suffix
+    listing = _format_loaded_files(files, with_previews=False)
+    if not listing:
+        return prompt_suffix
+    log.info(f"cat_alog: appended {len(files)} loaded file(s) to prompt suffix")
+    return prompt_suffix.rstrip() + "\n\n" + listing
