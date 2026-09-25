@@ -1,3 +1,4 @@
+import asyncio
 import os
 import threading
 import time
@@ -203,201 +204,212 @@ def list_loaded_files(cat):
     Returns a markdown formatted list showing files/URLs loaded in the current chat session
     and at the agent level, with their source, upload date, and content preview.
     """
+    files_dict = asyncio.run(_collect_loaded_files(cat))
+    return _format_loaded_files(files_dict, with_previews=True)
+
+
+async def _collect_loaded_files(cat) -> Dict[str, Dict[str, Any]]:
     agent_id = cat.agent_key
     chat_id = getattr(cat, "id", None)
 
-    output = []
-    output.append("# Loaded Files\n")
+    files_dict: Dict[str, Dict[str, Any]] = {}
 
-    async def _get_files():
-        files_dict: Dict[str, Dict[str, Any]] = {}
+    # ──────────────────────────────────────────────
+    # PHASE 1: Ground truth from FileManager (fast, no DB)
+    #   Lists files stored on disk for both agent and conversation levels.
+    # ──────────────────────────────────────────────
+    async def add_files_from_manager():
+        try:
+            for fm_file in cat.file_manager.list_files(agent_id):
+                if fm_file.name not in files_dict:
+                    files_dict[fm_file.name] = {
+                        "source": fm_file.name,
+                        "when": fm_file.last_modified,
+                        "content": None,
+                        "type": "agent",
+                    }
+        except Exception as e:
+            log.warning(f"cat_alog: FileManager error (agent): {e}")
 
-        # ──────────────────────────────────────────────
-        # PHASE 1: Ground truth from FileManager (fast, no DB)
-        #   Lists files stored on disk for both agent and conversation levels.
-        # ──────────────────────────────────────────────
-        async def add_files_from_manager():
+        if chat_id:
             try:
-                for fm_file in cat.file_manager.list_files(agent_id):
-                    if fm_file.name not in files_dict:
-                        files_dict[fm_file.name] = {
-                            "source": fm_file.name,
-                            "when": fm_file.last_modified,
-                            "content": None,
-                            "type": "agent",
-                        }
+                conv_path = os.path.join(agent_id, chat_id)
+                for fm_file in cat.file_manager.list_files(conv_path):
+                    files_dict[fm_file.name] = {
+                        "source": fm_file.name,
+                        "when": fm_file.last_modified,
+                        "content": None,
+                        "type": "conversation",
+                    }
             except Exception as e:
-                log.warning(f"cat_alog: FileManager error (agent): {e}")
+                log.warning(f"cat_alog: FileManager error (conversation): {e}")
 
-            if chat_id:
-                try:
-                    conv_path = os.path.join(agent_id, chat_id)
-                    for fm_file in cat.file_manager.list_files(conv_path):
-                        files_dict[fm_file.name] = {
-                            "source": fm_file.name,
-                            "when": fm_file.last_modified,
-                            "content": None,
-                            "type": "conversation",
-                        }
-                except Exception as e:
-                    log.warning(f"cat_alog: FileManager error (conversation): {e}")
+    # ──────────────────────────────────────────────
+    # PHASE 2: Targeted DB queries for content previews
+    #   Query 1: catalogue cards (is_catalogue_card=True) → get the summary.
+    #   Query 2: first chunks (chunk_index=0) → only for sources WITHOUT a card.
+    # ──────────────────────────────────────────────
+    async def add_db_previews(collection_name: str, is_episodic: bool):
+        try:
+            handler = cat.vector_memory_handler
+            meta_filter = {"chat_id": chat_id} if is_episodic else {}
+            scope_type = "conversation" if is_episodic else "agent"
 
-        # ──────────────────────────────────────────────
-        # PHASE 2: Targeted DB queries for content previews
-        #   Query 1: catalogue cards (is_catalogue_card=True) → get the summary.
-        #   Query 2: first chunks (chunk_index=0) → only for sources WITHOUT a card.
-        # ──────────────────────────────────────────────
-        async def add_db_previews(collection_name: str, is_episodic: bool):
+            results: List[Any] = []
+            sources_with_cards: set = set()
+
+            # ── Query 1: catalogue cards ──
             try:
-                handler = cat.vector_memory_handler
-                meta_filter = {"chat_id": chat_id} if is_episodic else {}
-                scope_type = "conversation" if is_episodic else "agent"
+                records, _ = await handler.get_all_tenant_points(
+                    collection_name, metadata={**meta_filter, "is_catalogue_card": True}, with_vectors=False,
+                )
+                for rec in records:
+                    src = ((rec.payload or {}).get("metadata", {}) or {}).get("source")
+                    if src:
+                        sources_with_cards.add(src)
+                results.extend(records)
+            except Exception:
+                log.debug(f"cat_alog: catalogue card query for {collection_name} not supported, skipping")
 
-                results: List[Any] = []
-                sources_with_cards: set = set()
+            # ── Query 2: first chunks (only for sources WITHOUT a card) ──
+            try:
+                records, _ = await handler.get_all_tenant_points(
+                    collection_name, metadata={**meta_filter, "chunk_index": 0}, with_vectors=False,
+                )
+                for rec in records:
+                    src = ((rec.payload or {}).get("metadata", {}) or {}).get("source")
+                    if src and src not in sources_with_cards:
+                        results.append(rec)
+            except Exception:
+                log.debug(f"cat_alog: first chunk query for {collection_name} not supported, skipping")
 
-                # ── Query 1: catalogue cards ──
-                try:
-                    records, _ = await handler.get_all_tenant_points(
-                        collection_name, metadata={**meta_filter, "is_catalogue_card": True}, with_vectors=False,
-                    )
-                    for rec in records:
-                        src = ((rec.payload or {}).get("metadata", {}) or {}).get("source")
-                        if src:
-                            sources_with_cards.add(src)
-                    results.extend(records)
-                except Exception:
-                    log.debug(f"cat_alog: catalogue card query for {collection_name} not supported, skipping")
+            # ── Process results ──
+            for record in results:
+                payload = record.payload or {}
+                meta = payload.get("metadata", {}) or {}
+                source = meta.get("source")
 
-                # ── Query 2: first chunks (only for sources WITHOUT a card) ──
-                try:
-                    records, _ = await handler.get_all_tenant_points(
-                        collection_name, metadata={**meta_filter, "chunk_index": 0}, with_vectors=False,
-                    )
-                    for rec in records:
-                        src = ((rec.payload or {}).get("metadata", {}) or {}).get("source")
-                        if src and src not in sources_with_cards:
-                            results.append(rec)
-                except Exception:
-                    log.debug(f"cat_alog: first chunk query for {collection_name} not supported, skipping")
+                if not source:  # or source.startswith("http"):
+                    continue
 
-                # ── Process results ──
-                for record in results:
-                    payload = record.payload or {}
-                    meta = payload.get("metadata", {}) or {}
-                    source = meta.get("source")
+                page_content = payload.get("page_content", "") or ""
 
-                    if not source:  # or source.startswith("http"):
+                if source not in files_dict:
+                    # Only URLs are allowed without a FileManager entry
+                    # (they have no file on disk).
+                    if not source.startswith("http"):
                         continue
+                    when_ts = meta.get("when", 0)
+                    when_str = datetime.fromtimestamp(when_ts).strftime("%Y-%m-%d %H:%M") if when_ts else "unknown"
+                    files_dict[source] = {
+                        "source": source,
+                        "when": when_str,
+                        "content": page_content[:500],
+                        "type": scope_type,
+                    }
 
-                    page_content = payload.get("page_content", "") or ""
-
-                    if source not in files_dict:
-                        # Only URLs are allowed without a FileManager entry
-                        # (they have no file on disk).
-                        if not source.startswith("http"):
+                is_card = meta.get("is_catalogue_card", False)
+                if is_card:
+                    # Prefer the full card stored in metadata: survives card
+                    # splitting (every segment carries it) and is immune to
+                    # the marker landing in a different segment.
+                    full_card = meta.get("full_card", "")
+                    if full_card:
+                        summary_marker = "## Summary\n\n"
+                        if summary_marker in full_card:
+                            summary = full_card.split(summary_marker, 1)[1].strip()[:500]
+                            files_dict[source]["content"] = summary
                             continue
-                        when_ts = meta.get("when", 0)
-                        when_str = datetime.fromtimestamp(when_ts).strftime("%Y-%m-%d %H:%M") if when_ts else "unknown"
-                        files_dict[source] = {
-                            "source": source,
-                            "when": when_str,
-                            "content": page_content[:500],
-                            "type": scope_type,
-                        }
+                    # fallback: parse the page_content (legacy cards)
+                    if page_content:
+                        summary_marker = "## Summary\n\n"
+                        if summary_marker in page_content:
+                            summary = page_content.split(summary_marker, 1)[1].strip()[:500]
+                            files_dict[source]["content"] = summary
+                elif files_dict[source].get("content") is None:
+                    files_dict[source]["content"] = page_content[:500]
+        except Exception as e:
+            log.warning(f"cat_alog: error reading collection {collection_name}: {e}")
 
-                    is_card = meta.get("is_catalogue_card", False)
-                    if is_card:
-                        # Prefer the full card stored in metadata: survives card
-                        # splitting (every segment carries it) and is immune to
-                        # the marker landing in a different segment.
-                        full_card = meta.get("full_card", "")
-                        if full_card:
-                            summary_marker = "## Summary\n\n"
-                            if summary_marker in full_card:
-                                summary = full_card.split(summary_marker, 1)[1].strip()[:500]
-                                files_dict[source]["content"] = summary
-                                continue
-                        # fallback: parse the page_content (legacy cards)
-                        if page_content:
-                            summary_marker = "## Summary\n\n"
-                            if summary_marker in page_content:
-                                summary = page_content.split(summary_marker, 1)[1].strip()[:500]
-                                files_dict[source]["content"] = summary
-                    elif files_dict[source].get("content") is None:
-                        files_dict[source]["content"] = page_content[:500]
-            except Exception as e:
-                log.warning(f"cat_alog: error reading collection {collection_name}: {e}")
+    # ──────────────────────────────────────────────
+    # PHASE 3: Legacy fallback
+    #   For files in FileManager without a preview (no chunk_index /
+    #   is_catalogue_card in metadata, e.g. pre-update files):
+    #   query one chunk by source with limit=1.
+    # ──────────────────────────────────────────────
+    async def add_legacy_fallback(collection_name: str, is_episodic: bool):
+        try:
+            handler = cat.vector_memory_handler
+            meta_filter = {"chat_id": chat_id} if is_episodic else {}
+            scope_type = "conversation" if is_episodic else "agent"
 
-        # ──────────────────────────────────────────────
-        # PHASE 3: Legacy fallback
-        #   For files in FileManager without a preview (no chunk_index /
-        #   is_catalogue_card in metadata, e.g. pre-update files):
-        #   query one chunk by source with limit=1.
-        # ──────────────────────────────────────────────
-        async def add_legacy_fallback(collection_name: str, is_episodic: bool):
-            try:
-                handler = cat.vector_memory_handler
-                meta_filter = {"chat_id": chat_id} if is_episodic else {}
-                scope_type = "conversation" if is_episodic else "agent"
+            for source, info in list(files_dict.items()):
+                if info.get("content") is not None:
+                    continue
+                if info["type"] != scope_type:
+                    continue
 
-                for source, info in list(files_dict.items()):
-                    if info.get("content") is not None:
-                        continue
-                    if info["type"] != scope_type:
-                        continue
+                # Match either by metadata.source (text chunks) or by
+                # metadata.image_file (images extracted from PDFs store the
+                # saved image file name there).
+                for match_key in ("source", "image_file"):
+                    try:
+                        records, _ = await handler.get_all_tenant_points(
+                            collection_name,
+                            metadata={**meta_filter, match_key: source},
+                            limit=1,
+                            with_vectors=False,
+                        )
+                        if records and records[0].payload:
+                            content = (records[0].payload.get("page_content") or "")[:500]
+                            if content:
+                                files_dict[source]["content"] = content
+                                log.debug(f"cat_alog: legacy fallback found preview for '{source}' ({match_key})")
+                                break
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.warning(f"cat_alog: error in legacy fallback for {collection_name}: {e}")
 
-                    # Match either by metadata.source (text chunks) or by
-                    # metadata.image_file (images extracted from PDFs store the
-                    # saved image file name there).
-                    for match_key in ("source", "image_file"):
-                        try:
-                            records, _ = await handler.get_all_tenant_points(
-                                collection_name,
-                                metadata={**meta_filter, match_key: source},
-                                limit=1,
-                                with_vectors=False,
-                            )
-                            if records and records[0].payload:
-                                content = (records[0].payload.get("page_content") or "")[:500]
-                                if content:
-                                    files_dict[source]["content"] = content
-                                    log.debug(f"cat_alog: legacy fallback found preview for '{source}' ({match_key})")
-                                    break
-                        except Exception:
-                            pass
-            except Exception as e:
-                log.warning(f"cat_alog: error in legacy fallback for {collection_name}: {e}")
+    # Execute all phases in order
+    await add_files_from_manager()
+    await add_db_previews(str(VectorMemoryType.DECLARATIVE), is_episodic=False)
+    await add_db_previews(str(VectorMemoryType.EPISODIC), is_episodic=True)
+    await add_legacy_fallback(str(VectorMemoryType.DECLARATIVE), is_episodic=False)
+    await add_legacy_fallback(str(VectorMemoryType.EPISODIC), is_episodic=True)
 
-        # Execute all phases in order
-        await add_files_from_manager()
-        await add_db_previews(str(VectorMemoryType.DECLARATIVE), is_episodic=False)
-        await add_db_previews(str(VectorMemoryType.EPISODIC), is_episodic=True)
-        await add_legacy_fallback(str(VectorMemoryType.DECLARATIVE), is_episodic=False)
-        await add_legacy_fallback(str(VectorMemoryType.EPISODIC), is_episodic=True)
+    return files_dict
 
-        return files_dict
 
-    import asyncio
-    files_dict = asyncio.run(_get_files())
+def _format_loaded_files(files_dict, with_previews: bool = False) -> str:
+    pieces = ["# Loaded Files\n"] if with_previews else ["# Loaded files"]
 
-    if not files_dict:
-        output.append("No files loaded in this conversation or agent.")
-        return "\n".join(output)
-
-    for source, info in sorted(files_dict.items()):
-        file_type = "Chat" if info["type"] == "conversation" else "Agent"
-        content = info.get("content", "")
-        when = info["when"]
-
-        output.append(f"## FILE NAME: {source}\n")
-        output.append(f"- **Type**: {file_type}")
-        output.append(f"- **Uploaded**: {when}\n")
-
-        if content:
-            output.append("**Content preview:**\n")
-            output.append(f"```\n{content}...\n```\n")
+    if with_previews:
+        if not files_dict:
+            pieces.append("No files loaded in this conversation or agent.")
         else:
-            output.append("**Content preview:** *(not available)*\n")
+            for source, info in sorted(files_dict.items()):
+                file_type = "Chat" if info["type"] == "conversation" else "Agent"
+                content = info.get("content", "")
+                when = info["when"]
 
-    return "\n".join(output)
+                pieces.append(f"## FILE NAME: {source}\n")
+                pieces.append(f"- **Type**: {file_type}")
+                pieces.append(f"- **Uploaded**: {when}\n")
+
+                if content:
+                    pieces.append("**Content preview:**\n")
+                    pieces.append(f"```\n{content}...\n```\n")
+                else:
+                    pieces.append("**Content preview:** *(not available)*\n")
+    else:
+        for source, info in sorted(files_dict.items()):
+            file_type = "Chat" if info["type"] == "conversation" else "Agent"
+            when = info["when"]
+            if isinstance(when, (float, int)):
+                when = datetime.fromtimestamp(when).strftime("%Y-%m-%d %H:%M")
+            elif not isinstance(when, str) and not when:
+                when = "unknown"
+            pieces.append(f"- **{source}** ({file_type}, uploaded {when})")
+
+    return "\n".join(pieces)
