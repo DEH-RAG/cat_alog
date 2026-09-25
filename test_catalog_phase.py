@@ -238,4 +238,27 @@ if __name__ == "__main__":
         "# Loaded Files\n\nNo files loaded in this conversation or agent."
     ), "tool empty output mismatch"
 
+    # ── (h) Hook escapes braces in file names (core does system_prompt.format) ─
+    brace_cat = build_cat(with_file=True)
+    brace_cat.file_manager.agent_files = [
+        SimpleNamespace(name="report{2024}.pdf", last_modified=1234567890.0)
+    ]
+    out_h = asyncio.run(cat_alog.agent_prompt_suffix("", brace_cat))
+    assert "report{{2024}}.pdf" in out_h, "(h) braces not escaped in hook output"
+    _ = "{}".format(out_h)  # must not raise on the escaped listing
+
+    # ── (i) Compact formatter: falsy when (0.0) -> "unknown" ──────────────
+    compact_i = cat_alog._format_loaded_files(
+        {
+            "zero.pdf": {
+                "source": "zero.pdf",
+                "when": 0.0,
+                "content": None,
+                "type": "agent",
+            }
+        },
+        with_previews=False,
+    )
+    assert "uploaded unknown" in compact_i, "(i) falsy when not normalized to unknown"
+
     print("test_catalog_phase: ALL ASSERTIONS PASSED")

@@ -649,10 +649,10 @@ def _format_loaded_files(files_dict, with_previews: bool = False) -> str:
         for source, info in sorted(files_dict.items()):
             file_type = "Chat" if info["type"] == "conversation" else "Agent"
             when = info["when"]
-            if isinstance(when, (float, int)):
-                when = datetime.fromtimestamp(when).strftime("%Y-%m-%d %H:%M")
-            elif not when:
+            if not when:
                 when = "unknown"
+            elif isinstance(when, (float, int)):
+                when = datetime.fromtimestamp(when).strftime("%Y-%m-%d %H:%M")
             pieces.append(f"- **{source}** ({file_type}, uploaded {when})")
 
     return "\n".join(pieces)
@@ -668,7 +668,7 @@ async def agent_prompt_suffix(prompt_suffix: str, cat) -> str:
         return prompt_suffix
     if not files:
         return prompt_suffix
-    listing = _format_loaded_files(files, with_previews=False)
+    listing = _format_loaded_files(files, with_previews=False).replace("{", "{{").replace("}", "}}")
     if not listing:
         return prompt_suffix
     log.info(f"cat_alog: appended {len(files)} loaded file(s) to prompt suffix")
