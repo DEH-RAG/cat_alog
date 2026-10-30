@@ -95,20 +95,76 @@ Maximum {max_summary_words} words.
 """
 
 
-def _phase_machine_active(cat=None) -> bool:
-    """True when the EffING phase machine is deployed and importable.
+_EFFICIENT_INGESTION_CONFIG_NAME = "EfficientIngestionConfiguration"
 
-    When the machine is active the ``catalog_cards`` phase owns card
-    generation and persistence, so the two ``before_rabbithole_*`` hooks
-    become no-ops (the in-memory TTL cache is no longer the persistence).
-    The import is lazy and guarded: with EffING absent this returns False and
-    the legacy hook behavior is kept. Import-safe (no side effects).
+
+async def _resolved_system_ingestion_config_name(cat) -> "Optional[str]":
+    """Effective SYSTEM-level ingestion engine name.
+
+    The ``ingestion`` category is one of the two system-level services (the
+    other is ``embedder``), so its selection is read against
+    ``DEFAULT_SYSTEM_KEY`` — never the agent key. ``resolved_config_name`` is
+    the canonical resolver (signature: ``resolved_config_name(lizard) -> str``);
+    a host that predates it is handled by reading the same single system-level
+    category entry directly, so both paths return the same value.
     """
     try:
-        import cat.plugins.cat_efficient_ingestion  # noqa: F401
-        return True
+        from cat.services.factory.ingestion import resolved_config_name
+    except ImportError:
+        resolved_config_name = None
+
+    if resolved_config_name is not None:
+        return await resolved_config_name(cat)
+
+    from cat.db.cruds import settings as crud_settings
+    from cat.db.database import DEFAULT_SYSTEM_KEY
+
+    saved = await crud_settings.get_settings_by_category(
+        DEFAULT_SYSTEM_KEY, "ingestion"
+    )
+    return (saved or {}).get("name")
+
+
+async def _phase_machine_active(cat=None) -> bool:
+    """Whether the EffING phase path owns card generation for this ingest.
+
+    Single source of truth for the two ingestion modes (same contract as
+    GraphRAG's phase path). The phase path is active **iff**:
+
+    ==========================  ======================  =============
+    EffING installed/loadable   SYSTEM ``ingestion``    phase path
+    ==========================  ======================  =============
+    no                          any                     inactive
+    yes                         core engine             inactive
+    yes                         efficient engine        active
+    ==========================  ======================  =============
+
+    ``yes`` means the phases module is importable from the CANONICAL path
+    ``cat.core_plugins.cat_efficient_ingestion.phases``. When the phase path is
+    active the ``catalog_cards`` phase owns card generation and persistence, so
+    the two ``before_rabbithole_*`` hooks are no-ops; in every other case the
+    classic hooks run (TTL cache + card append) and the phase registrations are
+    simply inert, so the two mechanisms can never run together and neither is
+    dead. Import-safe (no side effects).
+    """
+    try:
+        import cat.core_plugins.cat_efficient_ingestion.phases  # noqa: F401
     except Exception:
         return False
+
+    if cat is None:
+        return False
+
+    try:
+        name = await _resolved_system_ingestion_config_name(cat)
+    except Exception as exc:  # noqa: BLE001
+        log.warning(
+            f"cat_alog: could not resolve the system ingestion engine "
+            f"({exc!r}); using the legacy card hooks."
+        )
+        return False
+
+    return name == _EFFICIENT_INGESTION_CONFIG_NAME
 
 
 def _build_summary_prompt(source: str, full_text: str, max_summary_words: int) -> str:
@@ -183,7 +239,7 @@ def ingestion_phase_specs(specs, cat) -> list:
     unchanged (import-safe).
     """
     try:
-        from cat.plugins.cat_efficient_ingestion.phases import PhaseSpec
+        from cat.core_plugins.cat_efficient_ingestion.phases import PhaseSpec
     except Exception:
         return specs
     specs = specs or []
@@ -296,7 +352,7 @@ async def before_rabbithole_splits_documents(docs: List[Document], cat) -> List[
 
     # With the EffING phase machine active, the catalog_cards phase owns card
     # generation: the in-memory TTL cache is no longer the persistence.
-    if _phase_machine_active(cat):
+    if await _phase_machine_active(cat):
         return docs
 
     metadata = docs[0].metadata
@@ -340,7 +396,7 @@ async def before_rabbithole_splits_documents(docs: List[Document], cat) -> List[
 
 
 @hook(priority=10)
-def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Document]:
+async def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Document]:
     """
     Retrieve the pre-computed summary from the cat and append the catalogue card.
     """
@@ -349,7 +405,7 @@ def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Docume
 
     # With the EffING phase machine active, the catalog_cards phase owns card
     # generation and persistence: this hook is a no-op.
-    if _phase_machine_active(cat):
+    if await _phase_machine_active(cat):
         return docs
 
     metadata = docs[0].metadata

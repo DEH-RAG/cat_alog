@@ -28,7 +28,7 @@ phase-machine guard on the two ``before_rabbithole_*`` hooks:
 Runnable:  python test_catalog_phase.py
 Pure-stdlib + unittest.mock, plain asserts, no pytest, no model loading. All
 external packages (cat, cat.services.memory.models, langchain_core, pydantic,
-cat.plugins.cat_efficient_ingestion.phases) are stubbed in sys.modules
+cat.core_plugins.cat_efficient_ingestion.phases) are stubbed in sys.modules
 *BEFORE* cat_alog is imported (same pattern as MyGRAPH's
 test_ingestion_phase_machine.py). The ENTIRE body lives under
 ``if __name__ == "__main__":`` so importing this file executes zero code and
@@ -130,16 +130,51 @@ if __name__ == "__main__":
     cat_models.PointStruct = _StubBaseModel
     sys.modules["cat.services.memory.models"] = cat_models
 
-    # cat.plugins.cat_efficient_ingestion.phases.PhaseSpec (EffING present)
-    cat_plugins = types.ModuleType("cat.plugins")
-    cat_plugins.__path__ = []
-    sys.modules["cat.plugins"] = cat_plugins
-    effing = types.ModuleType("cat.plugins.cat_efficient_ingestion")
+    # cat.services.factory.ingestion.resolved_config_name (SYSTEM ingestion
+    # engine resolver, canonical GraphRAG contract). Mutable so the three
+    # truth-table rows can be exercised without re-importing cat_alog.
+    _RESOLVED_INGESTION = {"name": "EfficientIngestionConfiguration"}
+
+    cat_factory = types.ModuleType("cat.services.factory")
+    cat_factory.__path__ = []
+    sys.modules["cat.services.factory"] = cat_factory
+
+    ingestion_factory = types.ModuleType("cat.services.factory.ingestion")
+
+    async def resolved_config_name(lizard):
+        return _RESOLVED_INGESTION["name"]
+
+    ingestion_factory.resolved_config_name = resolved_config_name
+    sys.modules["cat.services.factory.ingestion"] = ingestion_factory
+
+    # Fallback surface (hosts predating resolved_config_name): same value.
+    cat_db = types.ModuleType("cat.db")
+    cat_db.__path__ = []
+    sys.modules["cat.db"] = cat_db
+    cat_db_database = types.ModuleType("cat.db.database")
+    cat_db_database.DEFAULT_SYSTEM_KEY = "system"
+    sys.modules["cat.db.database"] = cat_db_database
+    cat_db_cruds = types.ModuleType("cat.db.cruds")
+    cat_db_cruds.__path__ = []
+    sys.modules["cat.db.cruds"] = cat_db_cruds
+    cat_db_cruds_settings = types.ModuleType("cat.db.cruds.settings")
+
+    async def get_settings_by_category(key, category):
+        return {"name": _RESOLVED_INGESTION["name"]}
+
+    cat_db_cruds_settings.get_settings_by_category = get_settings_by_category
+    sys.modules["cat.db.cruds.settings"] = cat_db_cruds_settings
+
+    # cat.core_plugins.cat_efficient_ingestion.phases.PhaseSpec (EffING present)
+    cat_core_plugins = types.ModuleType("cat.core_plugins")
+    cat_core_plugins.__path__ = []
+    sys.modules["cat.core_plugins"] = cat_core_plugins
+    effing = types.ModuleType("cat.core_plugins.cat_efficient_ingestion")
     effing.__path__ = []
-    sys.modules["cat.plugins.cat_efficient_ingestion"] = effing
-    effing_phases = types.ModuleType("cat.plugins.cat_efficient_ingestion.phases")
+    sys.modules["cat.core_plugins.cat_efficient_ingestion"] = effing
+    effing_phases = types.ModuleType("cat.core_plugins.cat_efficient_ingestion.phases")
     effing_phases.PhaseSpec = _StubPhaseSpec
-    sys.modules["cat.plugins.cat_efficient_ingestion.phases"] = effing_phases
+    sys.modules["cat.core_plugins.cat_efficient_ingestion.phases"] = effing_phases
 
     sys.path.insert(0, REPO_ROOT)
     import cat_alog  # noqa: E402
@@ -331,7 +366,7 @@ if __name__ == "__main__":
     docs = [SimpleNamespace(page_content="hello world", metadata={"source": "src"})]
     out = asyncio.run(cat_alog.before_rabbithole_splits_documents(docs, cat_ok))
     assert out is docs, "splits hook must be a no-op when the phase machine is active"
-    out2 = cat_alog.before_rabbithole_stores_documents(docs, cat_ok)
+    out2 = asyncio.run(cat_alog.before_rabbithole_stores_documents(docs, cat_ok))
     assert out2 is docs, "stores hook must be a no-op when the phase machine is active"
 
     # ------------------------------------------------------------------
@@ -373,13 +408,26 @@ if __name__ == "__main__":
     assert "fake summary" in listing, listing
 
     # ------------------------------------------------------------------
-    # 6. EffING absent: specs no-op, hooks keep the legacy behavior
+    # 6. Truth table: (EffING importable, SYSTEM engine) -> phase path active
     # ------------------------------------------------------------------
-    del sys.modules["cat.plugins.cat_efficient_ingestion.phases"]
-    del sys.modules["cat.plugins.cat_efficient_ingestion"]
-    del sys.modules["cat.plugins"]
+    # Row 3 (already exercised in section 4): present + efficient engine ->
+    # active. Row 2: present + core engine -> classic path, classic hooks run.
+    _RESOLVED_INGESTION["name"] = "CoreIngestionConfiguration"
+    assert asyncio.run(cat_alog._phase_machine_active(cat_ok)) is False
+    out = asyncio.run(cat_alog.before_rabbithole_splits_documents(docs, cat_ok))
+    assert out is docs
+    assert cat_alog.CATALOGUES.get("agent", "chat", "src") == "fake summary"
+    out2 = asyncio.run(cat_alog.before_rabbithole_stores_documents(docs, cat_ok))
+    assert len(out2) == 2, "classic stores hook must append the card with the core engine"
+    assert out2[1].metadata["is_catalogue_card"] is True
+    _RESOLVED_INGESTION["name"] = "EfficientIngestionConfiguration"
+    assert asyncio.run(cat_alog._phase_machine_active(cat_ok)) is True
 
-    assert cat_alog._phase_machine_active(cat_ok) is False
+    # Row 1: EffING absent -> the engine selection is irrelevant, classic path.
+    del sys.modules["cat.core_plugins.cat_efficient_ingestion.phases"]
+    del sys.modules["cat.core_plugins.cat_efficient_ingestion"]
+
+    assert asyncio.run(cat_alog._phase_machine_active(cat_ok)) is False
 
     # specs accumulator is a no-op without EffING
     specs = cat_alog.ingestion_phase_specs([], cat_ok)
@@ -391,7 +439,7 @@ if __name__ == "__main__":
     assert cat_alog.CATALOGUES.get("agent", "chat", "src") == "fake summary"
 
     # legacy stores hook: card appended
-    out2 = cat_alog.before_rabbithole_stores_documents(docs, cat_ok)
+    out2 = asyncio.run(cat_alog.before_rabbithole_stores_documents(docs, cat_ok))
     assert len(out2) == 2, len(out2)
     assert out2[1].metadata["is_catalogue_card"] is True
     assert "fake summary" in out2[1].page_content
@@ -401,7 +449,7 @@ if __name__ == "__main__":
     # 7. CAT interfaces resolve on the upstream surface (AST-walk)
     # ------------------------------------------------------------------
     # Mirrors of the UPSTREAM CAT surface (verified against
-    # /root/git/grinning-cat-core @ feat/efficient-ingestion): the
+    # /root/git/grinning-cat-core @ 511acb9c): the
     # module-level names cat_alog imports plus the runtime attributes it
     # touches on the ``cat`` object (CheshireCat/StrayCat/BotMixin).
     # Upstream differences that hit other plugins do NOT apply here:
@@ -421,8 +469,16 @@ if __name__ == "__main__":
                 "memory": {
                     "models": {"VectorMemoryType": None, "PointStruct": None},
                 },
+                # GraphRAG phase-path contract: canonical SYSTEM ingestion
+                # resolver (guarded import; hosts predating it fall back to
+                # cat.db.cruds.settings).
+                "factory": {"ingestion": {"resolved_config_name": None}},
             },
-            "plugins": {
+            "db": {
+                "database": {"DEFAULT_SYSTEM_KEY": None},
+                "cruds": {"settings": None, "crud_settings": None},
+            },
+            "core_plugins": {
                 "cat_efficient_ingestion": {"phases": {"PhaseSpec": None}},
             },
         },
