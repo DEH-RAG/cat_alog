@@ -235,7 +235,11 @@ async def _resolve_embedder(cat):
 
 
 def _catalogue_card_point_id(
-    agent_key: str, chat_id: "Optional[str]", source: str, index: int = 0
+    agent_key: str,
+    chat_id: "Optional[str]",
+    source: str,
+    index: int = 0,
+    start_index: "Optional[int]" = None,
 ) -> str:
     """Deterministic, tenant/chat-scoped card point id shared by both modes.
 
@@ -243,10 +247,17 @@ def _catalogue_card_point_id(
     the id is derived from the source. It is ALSO scoped by the agent and the
     conversation: the same file name uploaded to two agents (or to two chats of
     one agent) must yield two distinct cards instead of overwriting each other.
-    Segment ``i > 0`` of an oversized card gets a stable suffix (segment ``0``
-    keeps the exact classic id).
+
+    A segmented (oversized) card derives its suffix from the segment's stable
+    ``start_index`` inside the normalized card text when available, falling back
+    to the ordinal ``index``. ``start_index == 0`` keeps the exact classic id,
+    so re-runs and re-embeds address the same points even if the split is
+    re-enumerated in a different order.
     """
-    suffix = "" if index == 0 else f":{index}"
+    if start_index is not None:
+        suffix = "" if start_index == 0 else f":s{int(start_index)}"
+    else:
+        suffix = "" if index == 0 else f":{index}"
     return uuid.uuid5(
         uuid.NAMESPACE_URL,
         f"catalogue_card:{agent_key}:{chat_id or ''}:{source}{suffix}",
@@ -317,29 +328,39 @@ def _point_order(record) -> Tuple[int, int]:
     return 1, 0
 
 
-async def _load_source_chunks(handler, source: str):
-    """Stored (collection, chunk points) for ``source``, cards/images excluded.
+async def _load_source_chunk_groups(handler, source: str):
+    """Stored chunks for ``source`` grouped by (collection, chat_id).
 
     Chunks live in DECLARATIVE for agent-scoped sources and in EPISODIC for
-    chat-scoped ones; the phase must write the card back to that SAME
-    collection. Previously stored cards are excluded so a re-run never
-    summarizes its own card, and derived image points are excluded because
-    they are not source text.
+    chat-scoped ones. A source file with the SAME NAME can exist in several
+    conversations (or in the agent KB and a conversation), so the lookup is
+    grouped by the chunk's ``chat_id``: each group is summarized and stored as
+    its own card, and one chat's text never leaks into another chat's card.
+
+    Within a collection, chunks without a ``chat_id`` form the agent-scoped
+    group. Previously stored cards are excluded so a re-run never summarizes its
+    own card, and derived image points are excluded because they are not source
+    text. Returns a list of ``(collection, chat_id, points)`` sorted by
+    ``start_index`` then ``chunk_index``.
     """
+    groups = []
     for collection in (str(VectorMemoryType.DECLARATIVE), str(VectorMemoryType.EPISODIC)):
         records, _ = await handler.get_all_tenant_points(
             collection, metadata={"source": source}, with_vectors=False,
         )
-        chunks = []
+        by_chat: Dict[Optional[str], list] = {}
         for record in records or []:
             meta = (record.payload or {}).get("metadata", {}) or {}
             if meta.get("is_catalogue_card") or meta.get("image") is True:
                 continue
-            if ((record.payload or {}).get("page_content") or "").strip():
-                chunks.append(record)
-        if chunks:
-            return collection, sorted(chunks, key=_point_order)
-    return None, []
+            if not ((record.payload or {}).get("page_content") or "").strip():
+                continue
+            by_chat.setdefault(meta.get("chat_id"), []).append(record)
+        for chat_id in sorted(by_chat, key=lambda value: (value is not None, str(value))):
+            groups.append(
+                (collection, chat_id, sorted(by_chat[chat_id], key=_point_order))
+            )
+    return groups
 
 
 def _segment_card(card: str, card_metadata: Dict, embedder) -> list:
@@ -349,13 +370,34 @@ def _segment_card(card: str, card_metadata: Dict, embedder) -> list:
     every stored segment carries the original metadata (``full_card``
     included). Reuse that splitter; when it is unavailable (EffING absent) the
     card is stored whole.
+
+    Every produced segment is marked ``is_catalogue_card_segment`` with a stable
+    ``start_index`` inside the normalized card text. The re-embed path SKIPS
+    splitting marked segments, so a later re-embed can never re-split the card
+    into a different segment count (which would drop the ``:s<offset>`` id
+    suffix); the offset also makes the id independent of enumeration order.
     """
     card_doc = Document(page_content=card, metadata=card_metadata)
     try:
         from cat.core_plugins.cat_efficient_ingestion.split import split_oversized
     except Exception:  # noqa: BLE001 - no splitter: store the card whole
-        return [card_doc]
-    return split_oversized([card_doc], embedder) or [card_doc]
+        segments = [card_doc]
+    else:
+        segments = split_oversized([card_doc], embedder) or [card_doc]
+
+    normalized = " ".join(card.split())
+    cursor = 0
+    for segment in segments:
+        offset = normalized.find(segment.page_content, cursor)
+        if offset < 0:
+            offset = cursor
+        segment.metadata = {
+            **segment.metadata,
+            "is_catalogue_card_segment": True,
+            "start_index": offset,
+        }
+        cursor = offset + len(segment.page_content)
+    return segments
 
 
 async def _agent_llm_identity(cat) -> str:
@@ -454,88 +496,95 @@ async def ingestion_phase_run(phase, source, completed_phases, cat) -> Any:
 
     handler = cat.vector_memory_handler
 
-    # The chunks live in DECLARATIVE (agent KB) or EPISODIC (chat-scoped); the
-    # card must go to the SAME collection. Bound here so the ordering below is
-    # deterministic and the summary never sees a previous card or an image.
-    collection, points = await _load_source_chunks(handler, source)
-    if not points:
+    # The chunks live in DECLARATIVE (agent KB) or EPISODIC (chat-scoped) and the
+    # SAME source name can exist in several chats. Grouping by (collection,
+    # chat_id) keeps each conversation's text isolated: every group becomes its
+    # own card, in the SAME collection, with its own chat_id.
+    groups = await _load_source_chunk_groups(handler, source)
+    if not groups:
         return {"status": "not_ready", "retry_after": 5}
 
-    chunks: List[str] = [
-        (rec.payload or {}).get("page_content", "") or "" for rec in points
-    ]
-    chunks = [content for content in chunks if content.strip()]
-
-    first_metadata: Dict = dict(
-        (points[0].payload or {}).get("metadata", {}) or {}
-    )
-    # EPISODIC scope is carried by the chunk metadata; without it the card
-    # cannot be chat-scoped (log and keep going: the chunks still exist).
-    chat_id = first_metadata.get("chat_id")
-    if collection == str(VectorMemoryType.EPISODIC) and not chat_id:
-        log.warning(
-            f"cat_alog: EPISODIC source '{source}' has no chat_id in its stored "
-            "points; the catalogue card cannot be chat-scoped."
-        )
-    if chat_id:
-        first_metadata["chat_id"] = chat_id
-
-    full_text = "\n\n".join(chunks)
-    if len(full_text) > max_document_chars:
-        full_text = full_text[:max_document_chars] + " [truncated] "
-
-    # Initial page: the source's persisted bytes (file on disk / EffING URL
-    # copy) truncated to max_document_chars. When neither is available, fall
-    # back to the stored first chunk (start_index, then chunk_index) and say so.
-    abstract = None
-    source_text = _decode_source(await _read_source_bytes(cat, source, chat_id))
-    if source_text is not None and source_text.strip():
-        abstract = source_text[:max_document_chars].strip()
-    if abstract is None:
-        abstract = chunks[0].strip()
-        log.warning(
-            f"cat_alog: no persisted bytes for '{source}'; using the stored "
-            "first chunk as the initial page (best-effort preview)."
-        )
-
-    prompt = _build_summary_prompt(source, full_text, max_summary_words)
-    summary = await _run_summary_agent(cat, prompt)
-
-    card, card_metadata = _build_catalogue_card(source, first_metadata, abstract, summary)
-
-    # Oversized cards are segmented exactly like the classic store path (the
-    # token-budget splitter copies the metadata, so ``full_card`` survives on
-    # every segment).
     embedder = await _resolve_embedder(cat)
-    segments = _segment_card(card, card_metadata, embedder)
-    vectors = await asyncio.to_thread(
-        embedder.embed_documents, [segment.page_content for segment in segments]
-    )
-    # Deterministic ids: re-runs/engine switches upsert the same card instead
-    # of accumulating duplicates (add_points_to_tenant is an upsert). The id
-    # is carried in the PAYLOAD too so a re-embed rebuild (which reconstructs
-    # points from their payload) keeps the identity instead of minting a new
-    # uuid4 — see EffING ``reembed._embed_phase``.
-    card_points = []
-    for index, (segment, vector) in enumerate(zip(segments, vectors)):
-        card_id = _catalogue_card_point_id(cat.agent_key, chat_id, source, index)
-        card_points.append(
-            PointStruct(
-                id=card_id,
-                payload={
-                    "id": card_id,
-                    "page_content": segment.page_content,
-                    "metadata": segment.metadata,
-                },
-                vector=vector,
-            )
-        )
-    await handler.add_points_to_tenant(collection, points=card_points)
 
-    log.info(
-        f"cat_alog: catalogue card stored for '{source}' "
-        f"in {collection} ({len(card_points)} segment(s))"
-    )
+    for collection, chat_id, points in groups:
+        chunks: List[str] = [
+            (rec.payload or {}).get("page_content", "") or "" for rec in points
+        ]
+        chunks = [content for content in chunks if content.strip()]
+
+        first_metadata: Dict = dict(
+            (points[0].payload or {}).get("metadata", {}) or {}
+        )
+        # EPISODIC scope is carried by the chunk metadata; without it the card
+        # cannot be chat-scoped (log and keep going: the chunks still exist).
+        if collection == str(VectorMemoryType.EPISODIC) and not chat_id:
+            log.warning(
+                f"cat_alog: EPISODIC source '{source}' has no chat_id in its stored "
+                "points; the catalogue card cannot be chat-scoped."
+            )
+        if chat_id:
+            first_metadata["chat_id"] = chat_id
+        else:
+            first_metadata.pop("chat_id", None)
+
+        full_text = "\n\n".join(chunks)
+        if len(full_text) > max_document_chars:
+            full_text = full_text[:max_document_chars] + " [truncated] "
+
+        # Initial page: the source's persisted bytes (file on disk / EffING URL
+        # copy) truncated to max_document_chars. When neither is available, fall
+        # back to the stored first chunk (start_index, then chunk_index) and say so.
+        abstract = None
+        source_text = _decode_source(await _read_source_bytes(cat, source, chat_id))
+        if source_text is not None and source_text.strip():
+            abstract = source_text[:max_document_chars].strip()
+        if abstract is None:
+            abstract = chunks[0].strip()
+            log.warning(
+                f"cat_alog: no persisted bytes for '{source}' (chat={chat_id}); "
+                "using the stored first chunk as the initial page (best-effort preview)."
+            )
+
+        prompt = _build_summary_prompt(source, full_text, max_summary_words)
+        summary = await _run_summary_agent(cat, prompt)
+
+        card, card_metadata = _build_catalogue_card(source, first_metadata, abstract, summary)
+
+        # Oversized cards are segmented exactly like the classic store path (the
+        # token-budget splitter copies the metadata, so ``full_card`` survives on
+        # every segment). Every segment is marked so a re-embed never re-splits it.
+        segments = _segment_card(card, card_metadata, embedder)
+        vectors = await asyncio.to_thread(
+            embedder.embed_documents, [segment.page_content for segment in segments]
+        )
+        # Deterministic ids: re-runs/engine switches upsert the same card instead
+        # of accumulating duplicates (add_points_to_tenant is an upsert). The id
+        # is carried in the PAYLOAD too so a re-embed rebuild (which reconstructs
+        # points from their payload) keeps the identity instead of minting a new
+        # uuid4 — see EffING ``reembed._embed_phase``.
+        card_points = []
+        for index, (segment, vector) in enumerate(zip(segments, vectors)):
+            segment_start = segment.metadata.get("start_index")
+            card_id = _catalogue_card_point_id(
+                cat.agent_key, chat_id, source, index, start_index=segment_start
+            )
+            card_points.append(
+                PointStruct(
+                    id=card_id,
+                    payload={
+                        "id": card_id,
+                        "page_content": segment.page_content,
+                        "metadata": segment.metadata,
+                    },
+                    vector=vector,
+                )
+            )
+        await handler.add_points_to_tenant(collection, points=card_points)
+
+        log.info(
+            f"cat_alog: catalogue card stored for '{source}' "
+            f"in {collection} (chat={chat_id}, {len(card_points)} segment(s))"
+        )
     return {"status": "done"}
 
 

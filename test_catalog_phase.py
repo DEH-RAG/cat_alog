@@ -605,6 +605,87 @@ if __name__ == "__main__":
             "(o) agent-scoped card payload must carry its id"
         )
 
+        # ── (t) B1: same source in two chats -> two isolated cards ──────────
+        chunk_alpha = SimpleNamespace(payload={
+            "page_content": "ALPHA CHUNK",
+            "metadata": {"source": "same.pdf", "chat_id": "chatA", "start_index": 0},
+        })
+        chunk_beta = SimpleNamespace(payload={
+            "page_content": "BETA CHUNK",
+            "metadata": {"source": "same.pdf", "chat_id": "chatB", "start_index": 0},
+        })
+        handler_t = FakePhaseHandler({EPS: [chunk_alpha, chunk_beta]})
+        fm_t = FakeFileManager([], files={
+            ("agent/chatA", "same.pdf"): b"ALPHA PAGE ONLY",
+            ("agent/chatB", "same.pdf"): b"BETA PAGE ONLY",
+        })
+        cat_t = FakeCat(fm_t, handler_t, {})
+
+        async def _echo_summary(cat, prompt):
+            return prompt
+
+        cat_alog._run_summary_agent = _echo_summary
+        cat_alog._resolve_embedder = _fake_resolve_embedder
+        result_t = asyncio.run(
+            cat_alog.ingestion_phase_run("catalog_cards", "same.pdf", {}, cat_t)
+        )
+        assert result_t == {"status": "done"}, "(t) phase did not finish"
+        assert len(handler_t.added) == 2, (
+            "(t) two chats of one source must produce two card writes"
+        )
+        cards_by_chat = {}
+        for collection_t, points_t in handler_t.added:
+            assert collection_t == EPS, "(t) chat-scoped card must land in EPISODIC"
+            cards_by_chat[points_t[0].payload["metadata"]["chat_id"]] = points_t
+        assert set(cards_by_chat) == {"chatA", "chatB"}, cards_by_chat.keys()
+        full_alpha = cards_by_chat["chatA"][0].payload["metadata"]["full_card"]
+        full_beta = cards_by_chat["chatB"][0].payload["metadata"]["full_card"]
+        assert "ALPHA" in full_alpha and "BETA" not in full_alpha, (
+            "(t) chat A card contains chat B text"
+        )
+        assert "BETA" in full_beta and "ALPHA" not in full_beta, (
+            "(t) chat B card contains chat A text"
+        )
+        assert cards_by_chat["chatA"][0].id != cards_by_chat["chatB"][0].id, (
+            "(t) the two chat cards must have distinct ids"
+        )
+
+        # ── (u) B2: oversized card segments are marked, id from start_index ──
+        handler_u = FakePhaseHandler({DEC: [SimpleNamespace(payload={
+            "page_content": "SMALL CHUNK",
+            "metadata": {"source": "big.txt", "start_index": 0},
+        })]})
+        fm_u = FakeFileManager([], files={("agent", "big.txt"): b"PAGE " * 400})
+        cat_u = FakeCat(fm_u, handler_u, {})
+        cat_alog._resolve_embedder = _fake_resolve_embedder
+        result_u = asyncio.run(
+            cat_alog.ingestion_phase_run("catalog_cards", "big.txt", {}, cat_u)
+        )
+        assert result_u == {"status": "done"}, "(u) phase did not finish"
+        _, points_u = handler_u.added[0]
+        assert len(points_u) > 1, "(u) oversized card was not segmented"
+        for point_u in points_u:
+            meta_u = point_u.payload["metadata"]
+            assert meta_u.get("is_catalogue_card_segment") is True, (
+                "(u) card segment must be marked so a re-embed never re-splits it"
+            )
+            assert isinstance(meta_u.get("start_index"), int), (
+                "(u) card segment must carry a stable start_index"
+            )
+            assert point_u.id == cat_alog._catalogue_card_point_id(
+                "agent", None, "big.txt", start_index=meta_u["start_index"]
+            ), "(u) card segment id must derive from start_index"
+        ids_u = [p.id for p in points_u]
+        assert len(set(ids_u)) == len(ids_u), "(u) duplicate segment ids"
+
+        handler_u.added.clear()
+        asyncio.run(
+            cat_alog.ingestion_phase_run("catalog_cards", "big.txt", {}, cat_u)
+        )
+        assert [p.id for p in handler_u.added[0][1]] == ids_u, (
+            "(u) a re-run must reproduce the same segment ids"
+        )
+
         # ── (p) Marker: LLM + sizes + prompt; cache tuning is NOT material ──
         LLM_SETTINGS["agent"] = {"name": "LLMConfig", "value": {"model": "gpt-x"}}
         marker_cat = build_cat(settings={})
