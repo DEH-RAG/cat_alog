@@ -208,7 +208,7 @@ async def ingestion_phase_settings_marker(phase, cat) -> Any:
     """
     if phase != "catalog_cards":
         return None
-    settings = await cat.mad_hatter.get_plugin().load_settings()
+    settings = await cat.plugin_manager.get_plugin().load_settings()
     settings = settings or {}
     config = (
         int(settings.get("max_document_chars", 8000)),
@@ -235,7 +235,7 @@ async def ingestion_phase_run(phase, source, completed_phases, cat) -> Any:
     if phase != "catalog_cards":
         return None
 
-    settings = await cat.mad_hatter.get_plugin().load_settings()
+    settings = await cat.plugin_manager.get_plugin().load_settings()
     settings = settings or {}
     max_document_chars = int(settings.get("max_document_chars", 8000))
     max_summary_words = int(settings.get("max_summary_words", 200))
@@ -314,7 +314,7 @@ async def before_rabbithole_splits_documents(docs: List[Document], cat) -> List[
         log.info(f"cat_alog: cache hit for '{agent_id}/{chat_id}/{source}'")
         return docs
 
-    settings = await cat.mad_hatter.get_plugin().load_settings()
+    settings = await cat.plugin_manager.get_plugin().load_settings()
     settings = settings or {}
     max_document_chars = int(settings.get("max_document_chars", 8000))
     max_summary_words = int(settings.get("max_summary_words", 200))

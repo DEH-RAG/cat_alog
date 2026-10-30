@@ -155,7 +155,7 @@ if __name__ == "__main__":
         async def load_settings(self):
             return dict(self._settings)
 
-    class _FakeMadHatter:
+    class _FakePluginManager:
         def __init__(self, settings):
             self._plugin = _FakePlugin(settings)
 
@@ -194,7 +194,7 @@ if __name__ == "__main__":
         cat = Mock()
         cat.agent_key = "agent"
         cat.id = "chat"
-        cat.mad_hatter = _FakeMadHatter(settings)
+        cat.plugin_manager = _FakePluginManager(settings)
         cat.agentic_workflow = _FakeAgenticWorkflow(summary)
         cat.large_language_model = Mock()
         cat.lizard = _FakeLizard()
@@ -428,7 +428,7 @@ if __name__ == "__main__":
         },
     }
     UPSTREAM_CAT_INSTANCE_SURFACE = {
-        "mad_hatter": {"get_plugin": {"load_settings": None}},
+        "plugin_manager": {"get_plugin": {"load_settings": None}},
         "agentic_workflow": {"run": None},
         "large_language_model": None,
         "vector_memory_handler": {
