@@ -76,9 +76,15 @@ if __name__ == "__main__":
         DECLARATIVE = "declarative"
         EPISODIC = "episodic"
 
+        def __str__(self):
+            return self.value
+
 
     class PointStruct:
-        pass
+        def __init__(self, id=None, payload=None, vector=None):
+            self.id = id
+            self.payload = payload or {}
+            self.vector = vector
 
 
     cat_memory_models.VectorMemoryType = VectorMemoryType
@@ -94,6 +100,7 @@ if __name__ == "__main__":
 
     INGESTION_ROWS = {}
     INGESTION_KEYS = []
+    LLM_SETTINGS = {}
 
 
     async def _fake_get_ingestion_status_keys(agent_id):
@@ -104,12 +111,19 @@ if __name__ == "__main__":
         return INGESTION_ROWS.get(key)
 
 
+    async def _fake_get_settings_by_category(key_id, category):
+        if category == "llm":
+            return LLM_SETTINGS.get(key_id)
+        return None
+
+
     cat_db = _types.ModuleType("cat.db")
     cat_db.crud = _types.ModuleType("cat.db.crud")
     cat_db.crud.read = _fake_crud_read
     cat_db_cruds = _types.ModuleType("cat.db.cruds")
     cat_db_settings = _types.ModuleType("cat.db.cruds.settings")
     cat_db_settings.get_ingestion_status_keys = _fake_get_ingestion_status_keys
+    cat_db_settings.get_settings_by_category = _fake_get_settings_by_category
     cat_db_cruds.settings = cat_db_settings
 
     sys.modules["pydantic"] = pydantic_mod
@@ -155,13 +169,19 @@ if __name__ == "__main__":
 
 
     class FakeFileManager:
-        def __init__(self, agent_files):
+        def __init__(self, agent_files, files=None):
             self.agent_files = agent_files
+            self.files = files or {}
 
         def list_files(self, path):
             if path == "agent":
                 return self.agent_files
             return []
+
+        def read_file(self, remote_filename, remote_root_dir=None):
+            if (remote_root_dir, remote_filename) in self.files:
+                return self.files[(remote_root_dir, remote_filename)]
+            return self.files.get(remote_filename)
 
 
     class FakePlugin:
@@ -178,6 +198,21 @@ if __name__ == "__main__":
 
         def get_plugin(self):
             return FakePlugin(self._settings)
+
+
+    class FakePhaseHandler:
+        """Collection-aware fake for the phase: separate chunks per collection."""
+
+        def __init__(self, by_collection):
+            self.by_collection = by_collection
+            self.added = []
+
+        async def get_all_tenant_points(self, collection_name, metadata=None,
+                                        limit=None, offset=None, with_vectors=True):
+            return list(self.by_collection.get(collection_name, [])), None
+
+        async def add_points_to_tenant(self, collection_name, points):
+            self.added.append((collection_name, list(points)))
 
 
     class FakeCat:
@@ -411,5 +446,170 @@ if __name__ == "__main__":
     )
     assert "original.pdf" in out_l, "(l) the source file itself disappeared"
     assert "photo.jpg" in out_l, "(l) an image that IS the source must stay"
+
+    # ── (m) Deterministic card id shared by the phase and the classic hook ──
+    classic_cat = build_cat(with_file=True)
+    cat_alog.CATALOGUES.set("agent", classic_cat.id, "report.pdf", "S")
+    out_m = asyncio.run(cat_alog.before_rabbithole_stores_documents(
+        [Document(page_content="chunk text", metadata={"source": "report.pdf"})],
+        classic_cat,
+    ))
+    cards_m = [d for d in out_m if d.metadata.get("is_catalogue_card") is True]
+    assert len(cards_m) == 1, "(m) classic card missing"
+    assert cards_m[0].id == cat_alog._catalogue_card_point_id("report.pdf"), (
+        "(m) classic card does not use the shared deterministic id"
+    )
+
+    # Load the REAL token-budget splitter under the canonical core-plugin path
+    # so (n) exercises the same segmentation the classic store path uses.
+    import importlib.util
+
+    cat_core = types.ModuleType("cat.core_plugins")
+    cat_core.__path__ = []
+    effing_pkg = types.ModuleType("cat.core_plugins.cat_efficient_ingestion")
+    effing_pkg.__path__ = []
+    sys.modules["cat.core_plugins"] = cat_core
+    sys.modules["cat.core_plugins.cat_efficient_ingestion"] = effing_pkg
+    _split_spec = importlib.util.spec_from_file_location(
+        "cat.core_plugins.cat_efficient_ingestion.split",
+        "/root/git/plugins/cat-efficient-ingestion/split.py",
+    )
+    sys.modules["langchain_core.documents"].Document = Document
+    log_mod.log = log_mod
+    _split_mod = importlib.util.module_from_spec(_split_spec)
+    sys.modules[_split_spec.name] = _split_mod
+    _split_spec.loader.exec_module(_split_mod)
+
+    DEC = str(VectorMemoryType.DECLARATIVE)
+    EPS = str(VectorMemoryType.EPISODIC)
+
+    class FakeEmbedder:
+        def __init__(self, max_tokens=20):
+            self.max_input_tokens = max_tokens
+
+        def _estimate_tokens(self, text):
+            return max(1, len(text.split()))
+
+        def embed_documents(self, texts):
+            return [[float(len(text))] for text in texts]
+
+    async def _fake_summary_agent(cat, prompt):
+        return " ".join(f"word{i}" for i in range(300))
+
+    async def _fake_resolve_embedder(cat):
+        return FakeEmbedder(20)
+
+    original_summary = cat_alog._run_summary_agent
+    original_embedder = cat_alog._resolve_embedder
+    cat_alog._run_summary_agent = _fake_summary_agent
+    cat_alog._resolve_embedder = _fake_resolve_embedder
+    try:
+        # ── (n) EPISODIC scope, start_index ordering, segmented card, ids ──
+        chunk_late = SimpleNamespace(payload={
+            "page_content": "LATE CHUNK",
+            "metadata": {"source": "chat.pdf", "chat_id": "chat1", "start_index": 50},
+        })
+        chunk_first = SimpleNamespace(payload={
+            "page_content": "FIRST CHUNK",
+            "metadata": {"source": "chat.pdf", "chat_id": "chat1", "start_index": 0},
+        })
+        phase_handler = FakePhaseHandler({EPS: [chunk_late, chunk_first]})
+        phase_cat = FakeCat(FakeFileManager([]), phase_handler, {})
+
+        result_n = asyncio.run(
+            cat_alog.ingestion_phase_run("catalog_cards", "chat.pdf", {}, phase_cat)
+        )
+        assert result_n == {"status": "done"}, "(n) phase did not finish"
+        assert len(phase_handler.added) == 1, "(n) expected one upsert batch"
+        collection_n, points_n = phase_handler.added[0]
+        assert collection_n == EPS, "(n) chat-scoped card must land in EPISODIC"
+        assert len(points_n) > 1, "(n) oversized card was not segmented"
+        assert all(
+            p.payload["metadata"].get("is_catalogue_card") is True for p in points_n
+        ), "(n) every segment must carry the card marker"
+        assert all(p.payload["metadata"].get("full_card") for p in points_n), (
+            "(n) every segment must carry full_card"
+        )
+        assert all(p.payload["metadata"].get("chat_id") == "chat1" for p in points_n), (
+            "(n) EPISODIC chat_id lost on the card"
+        )
+        assert "FIRST CHUNK" in points_n[0].payload["metadata"]["full_card"], (
+            "(n) initial page not taken from the smallest start_index chunk"
+        )
+        assert points_n[0].id == cat_alog._catalogue_card_point_id("chat.pdf"), (
+            "(n) first segment must use the shared deterministic id"
+        )
+        ids_n = [p.id for p in points_n]
+        assert len(set(ids_n)) == len(ids_n), "(n) duplicate segment ids"
+        assert "uuid4" not in repr(ids_n)
+
+        phase_handler.added.clear()
+        asyncio.run(
+            cat_alog.ingestion_phase_run("catalog_cards", "chat.pdf", {}, phase_cat)
+        )
+        assert [p.id for p in phase_handler.added[0][1]] == ids_n, (
+            "(n) re-run must upsert the same ids"
+        )
+
+        # ── (o) FILE source: initial page from the saved bytes (DECLARATIVE) ──
+        file_manager_o = FakeFileManager(
+            [], files={("agent", "lesson.txt"): b"PAGE ONE CONTENT " * 20}
+        )
+        handler_o = FakePhaseHandler({DEC: [SimpleNamespace(payload={
+            "page_content": "CHUNK BODY",
+            "metadata": {"source": "lesson.txt", "start_index": 0},
+        })]})
+        cat_o = FakeCat(file_manager_o, handler_o, {})
+
+        async def _short_summary(cat, prompt):
+            return "SHORT SUMMARY"
+
+        cat_alog._run_summary_agent = _short_summary
+
+        async def _no_limit_embedder(cat):
+            return FakeEmbedder(None)
+
+        cat_alog._resolve_embedder = _no_limit_embedder
+        result_o = asyncio.run(
+            cat_alog.ingestion_phase_run("catalog_cards", "lesson.txt", {}, cat_o)
+        )
+        assert result_o == {"status": "done"}, "(o) phase did not finish"
+        collection_o, points_o = handler_o.added[0]
+        assert collection_o == DEC, "(o) agent-scoped card must land in DECLARATIVE"
+        full_card_o = points_o[0].payload["metadata"]["full_card"]
+        assert "PAGE ONE CONTENT" in full_card_o, (
+            "(o) initial page not read from the source file bytes"
+        )
+        assert points_o[0].id == cat_alog._catalogue_card_point_id("lesson.txt")
+
+        # ── (p) Marker: LLM + sizes + prompt; cache tuning is NOT material ──
+        LLM_SETTINGS["agent"] = {"name": "LLMConfig", "value": {"model": "gpt-x"}}
+        marker_cat = build_cat(settings={})
+        m1 = asyncio.run(
+            cat_alog.ingestion_phase_settings_marker("catalog_cards", marker_cat)
+        )
+        cache_changed = build_cat(settings={
+            "cache_ttl_seconds": 1, "cache_max_size": 1,
+        })
+        m2 = asyncio.run(
+            cat_alog.ingestion_phase_settings_marker("catalog_cards", cache_changed)
+        )
+        assert m1 == m2, "(p) cache tuning must not change the marker"
+        words_changed = build_cat(settings={"max_summary_words": 201})
+        m3 = asyncio.run(
+            cat_alog.ingestion_phase_settings_marker("catalog_cards", words_changed)
+        )
+        assert m3 != m1, "(p) max_summary_words must change the marker"
+        LLM_SETTINGS["agent"] = {"name": "LLMConfig", "value": {"model": "gpt-y"}}
+        m4 = asyncio.run(
+            cat_alog.ingestion_phase_settings_marker("catalog_cards", marker_cat)
+        )
+        assert m4 != m1, "(p) agent LLM change must change the marker"
+        assert asyncio.run(
+            cat_alog.ingestion_phase_settings_marker("other_phase", marker_cat)
+        ) is None, "(p) unknown phases must yield a conservative None marker"
+    finally:
+        cat_alog._run_summary_agent = original_summary
+        cat_alog._resolve_embedder = original_embedder
 
     print("test_catalog_phase: ALL ASSERTIONS PASSED")

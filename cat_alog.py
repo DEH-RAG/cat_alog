@@ -234,6 +234,145 @@ async def _resolve_embedder(cat):
     return await cat.embedder()
 
 
+def _catalogue_card_point_id(source: str, index: int = 0) -> str:
+    """Deterministic card point id shared by the classic hook and the phase.
+
+    A re-run (or an engine switch) must UPSERT the card, never duplicate it, so
+    the id is derived from the source only. Segment ``i > 0`` of an oversized
+    card gets a stable suffix (segment ``0`` keeps the exact classic id).
+    """
+    suffix = "" if index == 0 else f":{index}"
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"catalogue_card:{source}{suffix}").hex
+
+
+def _is_url_source(source: str) -> bool:
+    return str(source).startswith(("http://", "https://"))
+
+
+def _decode_source(data: "Optional[bytes]") -> "Optional[str]":
+    if data is None:
+        return None
+    try:
+        return data.decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 - a preview is best-effort
+        return None
+
+
+async def _read_source_bytes(cat, source: str, chat_id: "Optional[str]") -> "Optional[bytes]":
+    """Raw bytes of ``source`` as persisted on disk (file or URL copy).
+
+    Files live under the agent root or the conversation root; URLs are
+    persisted by the efficient-ingestion plugin under the deterministic name
+    ``_persisted_url_file_name`` (same path: agent root / chat root). ``None``
+    when neither copy exists (the caller then falls back to the stored points).
+    """
+    file_manager = getattr(cat, "file_manager", None)
+    if file_manager is None:
+        return None
+    agent_id = cat.agent_key
+
+    if _is_url_source(source):
+        try:
+            from cat.core_plugins.cat_efficient_ingestion.reembed import (
+                _persisted_url_file_name,
+            )
+        except Exception:  # noqa: BLE001 - EffING absent/older: no persisted URL copy
+            return None
+        root = os.path.join(agent_id, str(chat_id)) if chat_id else agent_id
+        try:
+            persisted_name = _persisted_url_file_name(source, root)
+            return file_manager.read_file(persisted_name, root)
+        except Exception:  # noqa: BLE001
+            return None
+
+    # FILE: the chat copy (when chat-scoped) shadows the agent copy.
+    roots = [agent_id]
+    if chat_id:
+        roots.insert(0, os.path.join(agent_id, str(chat_id)))
+    for root in dict.fromkeys(roots):
+        try:
+            data = file_manager.read_file(source, root)
+        except Exception:  # noqa: BLE001
+            data = None
+        if data is not None:
+            return data
+    return None
+
+
+def _point_order(record) -> Tuple[int, int]:
+    """Ordering key for a stored chunk: ``start_index`` then ``chunk_index``."""
+    meta = (record.payload or {}).get("metadata", {}) or {}
+    for key in ("start_index", "chunk_index"):
+        value = meta.get(key)
+        if isinstance(value, (int, float)):
+            return int(value), 0
+    return 1, 0
+
+
+async def _load_source_chunks(handler, source: str):
+    """Stored (collection, chunk points) for ``source``, cards/images excluded.
+
+    Chunks live in DECLARATIVE for agent-scoped sources and in EPISODIC for
+    chat-scoped ones; the phase must write the card back to that SAME
+    collection. Previously stored cards are excluded so a re-run never
+    summarizes its own card, and derived image points are excluded because
+    they are not source text.
+    """
+    for collection in (str(VectorMemoryType.DECLARATIVE), str(VectorMemoryType.EPISODIC)):
+        records, _ = await handler.get_all_tenant_points(
+            collection, metadata={"source": source}, with_vectors=False,
+        )
+        chunks = []
+        for record in records or []:
+            meta = (record.payload or {}).get("metadata", {}) or {}
+            if meta.get("is_catalogue_card") or meta.get("image") is True:
+                continue
+            if ((record.payload or {}).get("page_content") or "").strip():
+                chunks.append(record)
+        if chunks:
+            return collection, sorted(chunks, key=_point_order)
+    return None, []
+
+
+def _segment_card(card: str, card_metadata: Dict, embedder) -> list:
+    """Split an oversized card exactly like the classic store path.
+
+    The classic path hands the card Document to the token-budget splitter, so
+    every stored segment carries the original metadata (``full_card``
+    included). Reuse that splitter; when it is unavailable (EffING absent) the
+    card is stored whole.
+    """
+    card_doc = Document(page_content=card, metadata=card_metadata)
+    try:
+        from cat.core_plugins.cat_efficient_ingestion.split import split_oversized
+    except Exception:  # noqa: BLE001 - no splitter: store the card whole
+        return [card_doc]
+    return split_oversized([card_doc], embedder) or [card_doc]
+
+
+async def _agent_llm_identity(cat) -> str:
+    """Stable, secret-free identity of the agent's configured LLM.
+
+    ``<config class>:<model>`` from the agent-scoped ``llm`` service setting;
+    default/missing LLMs collapse to a stable sentinel so the phase marker
+    stays deterministic. Never exposes credentials.
+    """
+    try:
+        from cat.db.cruds import settings as crud_settings
+
+        saved = await crud_settings.get_settings_by_category(cat.agent_key, "llm")
+    except Exception:  # noqa: BLE001
+        return "unknown"
+    if not saved:
+        return "none"
+    name = str(saved.get("name") or "")
+    value = saved.get("value") or {}
+    model = value.get("model") if isinstance(value, dict) else None
+    if name and name != "LLMDefaultConfig":
+        return f"{name}:{model or ''}"
+    return "default"
+
+
 @hook(priority=10)
 def ingestion_phase_specs(specs, cat) -> list:
     """Accumulator registrant declaring the ``catalog_cards`` phase.
@@ -264,10 +403,12 @@ def ingestion_phase_specs(specs, cat) -> list:
 async def ingestion_phase_settings_marker(phase, cat) -> Any:
     """Material settings marker for the ``catalog_cards`` phase.
 
-    SHA-256 fingerprint of the effective card config (max_document_chars,
-    max_summary_words, cache_ttl_seconds, cache_max_size) plus the summary
-    prompt template: any material change invalidates previously generated
-    cards. ``None`` for unknown phases (conservative stale).
+    SHA-256 fingerprint of the agent LLM identity, ``max_document_chars``,
+    ``max_summary_words`` and the summary prompt template: any change that can
+    alter the produced card invalidates previously generated cards. The cache
+    tuning (``cache_ttl_seconds`` / ``cache_max_size``) is deliberately NOT
+    part of the marker — it does not change the output. ``None`` for unknown
+    phases (conservative stale).
     """
     if phase != "catalog_cards":
         return None
@@ -276,10 +417,10 @@ async def ingestion_phase_settings_marker(phase, cat) -> Any:
     config = (
         int(settings.get("max_document_chars", 8000)),
         int(settings.get("max_summary_words", 200)),
-        int(settings.get("cache_ttl_seconds", 3600)),
-        int(settings.get("cache_max_size", 100)),
     )
-    fingerprint_source = repr((config, _SUMMARY_PROMPT_TEMPLATE))
+    fingerprint_source = repr(
+        (await _agent_llm_identity(cat), config, _SUMMARY_PROMPT_TEMPLATE)
+    )
     return hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()
 
 
@@ -304,51 +445,83 @@ async def ingestion_phase_run(phase, source, completed_phases, cat) -> Any:
     max_summary_words = int(settings.get("max_summary_words", 200))
 
     handler = cat.vector_memory_handler
-    records, _ = await handler.get_all_tenant_points(
-        str(VectorMemoryType.DECLARATIVE),
-        metadata={"source": source},
-        with_vectors=False,
-    )
 
-    # Collect the source's stored chunk texts, excluding any previously
-    # stored catalogue card (a re-run must not summarize its own card).
-    chunks: List[str] = []
-    first_metadata: Dict = {}
-    for rec in records or []:
-        payload = rec.payload or {}
-        meta = payload.get("metadata", {}) or {}
-        if meta.get("is_catalogue_card"):
-            continue
-        content = payload.get("page_content", "") or ""
-        if content.strip():
-            if not chunks:
-                first_metadata = meta
-            chunks.append(content)
-    if not chunks:
+    # The chunks live in DECLARATIVE (agent KB) or EPISODIC (chat-scoped); the
+    # card must go to the SAME collection. Bound here so the ordering below is
+    # deterministic and the summary never sees a previous card or an image.
+    collection, points = await _load_source_chunks(handler, source)
+    if not points:
         return {"status": "not_ready", "retry_after": 5}
+
+    chunks: List[str] = [
+        (rec.payload or {}).get("page_content", "") or "" for rec in points
+    ]
+    chunks = [content for content in chunks if content.strip()]
+
+    first_metadata: Dict = dict(
+        (points[0].payload or {}).get("metadata", {}) or {}
+    )
+    # EPISODIC scope is carried by the chunk metadata; without it the card
+    # cannot be chat-scoped (log and keep going: the chunks still exist).
+    chat_id = first_metadata.get("chat_id")
+    if collection == str(VectorMemoryType.EPISODIC) and not chat_id:
+        log.warning(
+            f"cat_alog: EPISODIC source '{source}' has no chat_id in its stored "
+            "points; the catalogue card cannot be chat-scoped."
+        )
+    if chat_id:
+        first_metadata["chat_id"] = chat_id
 
     full_text = "\n\n".join(chunks)
     if len(full_text) > max_document_chars:
         full_text = full_text[:max_document_chars] + " [truncated] "
 
+    # Initial page: the source's persisted bytes (file on disk / EffING URL
+    # copy) truncated to max_document_chars. When neither is available, fall
+    # back to the stored first chunk (start_index, then chunk_index) and say so.
+    abstract = None
+    source_text = _decode_source(await _read_source_bytes(cat, source, chat_id))
+    if source_text is not None and source_text.strip():
+        abstract = source_text[:max_document_chars].strip()
+    if abstract is None:
+        abstract = chunks[0].strip()
+        log.warning(
+            f"cat_alog: no persisted bytes for '{source}'; using the stored "
+            "first chunk as the initial page (best-effort preview)."
+        )
+
     prompt = _build_summary_prompt(source, full_text, max_summary_words)
     summary = await _run_summary_agent(cat, prompt)
 
-    abstract = chunks[0].strip()
     card, card_metadata = _build_catalogue_card(source, first_metadata, abstract, summary)
 
+    # Oversized cards are segmented exactly like the classic store path (the
+    # token-budget splitter copies the metadata, so ``full_card`` survives on
+    # every segment).
     embedder = await _resolve_embedder(cat)
-    vector = (await asyncio.to_thread(embedder.embed_documents, [card]))[0]
-    # Deterministic point id: re-runs upsert the same card instead of
-    # accumulating duplicates (add_points_to_tenant is an upsert).
-    point = PointStruct(
-        id=uuid.uuid5(uuid.NAMESPACE_URL, f"catalogue_card:{source}").hex,
-        payload={"page_content": card, "metadata": card_metadata},
-        vector=vector,
+    segments = _segment_card(card, card_metadata, embedder)
+    vectors = await asyncio.to_thread(
+        embedder.embed_documents, [segment.page_content for segment in segments]
     )
-    await handler.add_points_to_tenant(str(VectorMemoryType.DECLARATIVE), points=[point])
+    # Deterministic ids: re-runs/engine switches upsert the same card instead
+    # of accumulating duplicates (add_points_to_tenant is an upsert).
+    card_points = [
+        PointStruct(
+            id=_catalogue_card_point_id(source, index),
+            payload={
+                "page_content": segment.page_content,
+                "metadata": segment.metadata,
+            },
+            vector=vector,
+        )
+        for index, (segment, vector) in enumerate(zip(segments, vectors))
+    ]
+    await handler.add_points_to_tenant(collection, points=card_points)
 
-    log.info(f"cat_alog: catalogue card stored for '{source}'")
+    log.info(
+        f"cat_alog: catalogue card stored for '{source}' "
+        f"in {collection} ({len(card_points)} segment(s))"
+    )
     return {"status": "done"}
 
 
@@ -439,8 +612,13 @@ async def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[
 
     card, card_metadata = _build_catalogue_card(source, metadata, abstract, summary)
 
+    # Share the phase's deterministic card identity so a re-ingest or an
+    # engine switch targets the same card instead of adding a duplicate.
+    card_doc = Document(page_content=card, metadata=card_metadata)
+    card_doc.id = _catalogue_card_point_id(source)
+
     log.debug(f"cat_alog: added catalogue card for '{source}'")
-    return docs + [Document(page_content=card, metadata=card_metadata)]
+    return docs + [card_doc]
 
 
 @tool(examples=[
