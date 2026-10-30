@@ -234,15 +234,23 @@ async def _resolve_embedder(cat):
     return await cat.embedder()
 
 
-def _catalogue_card_point_id(source: str, index: int = 0) -> str:
-    """Deterministic card point id shared by the classic hook and the phase.
+def _catalogue_card_point_id(
+    agent_key: str, chat_id: "Optional[str]", source: str, index: int = 0
+) -> str:
+    """Deterministic, tenant/chat-scoped card point id shared by both modes.
 
     A re-run (or an engine switch) must UPSERT the card, never duplicate it, so
-    the id is derived from the source only. Segment ``i > 0`` of an oversized
-    card gets a stable suffix (segment ``0`` keeps the exact classic id).
+    the id is derived from the source. It is ALSO scoped by the agent and the
+    conversation: the same file name uploaded to two agents (or to two chats of
+    one agent) must yield two distinct cards instead of overwriting each other.
+    Segment ``i > 0`` of an oversized card gets a stable suffix (segment ``0``
+    keeps the exact classic id).
     """
     suffix = "" if index == 0 else f":{index}"
-    return uuid.uuid5(uuid.NAMESPACE_URL, f"catalogue_card:{source}{suffix}").hex
+    return uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"catalogue_card:{agent_key}:{chat_id or ''}:{source}{suffix}",
+    ).hex
 
 
 def _is_url_source(source: str) -> bool:
@@ -504,18 +512,24 @@ async def ingestion_phase_run(phase, source, completed_phases, cat) -> Any:
         embedder.embed_documents, [segment.page_content for segment in segments]
     )
     # Deterministic ids: re-runs/engine switches upsert the same card instead
-    # of accumulating duplicates (add_points_to_tenant is an upsert).
-    card_points = [
-        PointStruct(
-            id=_catalogue_card_point_id(source, index),
-            payload={
-                "page_content": segment.page_content,
-                "metadata": segment.metadata,
-            },
-            vector=vector,
+    # of accumulating duplicates (add_points_to_tenant is an upsert). The id
+    # is carried in the PAYLOAD too so a re-embed rebuild (which reconstructs
+    # points from their payload) keeps the identity instead of minting a new
+    # uuid4 — see EffING ``reembed._embed_phase``.
+    card_points = []
+    for index, (segment, vector) in enumerate(zip(segments, vectors)):
+        card_id = _catalogue_card_point_id(cat.agent_key, chat_id, source, index)
+        card_points.append(
+            PointStruct(
+                id=card_id,
+                payload={
+                    "id": card_id,
+                    "page_content": segment.page_content,
+                    "metadata": segment.metadata,
+                },
+                vector=vector,
+            )
         )
-        for index, (segment, vector) in enumerate(zip(segments, vectors))
-    ]
     await handler.add_points_to_tenant(collection, points=card_points)
 
     log.info(
@@ -615,7 +629,7 @@ async def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[
     # Share the phase's deterministic card identity so a re-ingest or an
     # engine switch targets the same card instead of adding a duplicate.
     card_doc = Document(page_content=card, metadata=card_metadata)
-    card_doc.id = _catalogue_card_point_id(source)
+    card_doc.id = _catalogue_card_point_id(agent_id, chat_id, source)
 
     log.debug(f"cat_alog: added catalogue card for '{source}'")
     return docs + [card_doc]

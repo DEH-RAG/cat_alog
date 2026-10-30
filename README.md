@@ -37,7 +37,7 @@ The phase behaves as follows:
 - **Initial page**: the source's persisted bytes (the file on disk, or the URL copy persisted by EffING) truncated to `max_document_chars`. When no copy exists it logs a warning and falls back to the stored first chunk (ordered by `start_index`, then `chunk_index`).
 - **Collection scope**: the card is written to the SAME collection as its chunks — `DECLARATIVE` for agent-scoped sources, `EPISODIC` for chat-scoped ones — and copies `chat_id` from the chunk metadata. An EPISODIC source without `chat_id` logs a warning because the card cannot be chat-scoped.
 - **Oversized cards** are segmented with EffING's `split_oversized` splitter, exactly like the classic store path; every segment carries `full_card`, so a similarity hit on any part retrieves the whole card.
-- **Deterministic id**: `uuid5("catalogue_card:<source>")`, with a stable `:<index>` suffix for segments after the first. Re-runs and engine switches therefore UPSERT the same card instead of accumulating duplicates.
+- **Deterministic id**: `uuid5("catalogue_card:<agent_key>:<chat_id>:<source>")`, with a stable `:<index>` suffix for segments after the first. Re-runs and engine switches therefore UPSERT the same card instead of accumulating duplicates.
 - **Tri-state contract**: `{"status": "done"}` when the card is stored, `{"status": "not_ready", "retry_after": 5}` while the source's points are still absent, and an exception is a permanent failure (ERROR).
 
 ## Settings

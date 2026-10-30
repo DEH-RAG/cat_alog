@@ -92,6 +92,21 @@ if __name__ == "__main__":
     cat_memory.models = cat_memory_models
     cat_services.memory = cat_memory
 
+    # `cat.services.factory.ingestion.resolved_config_name` (SYSTEM-level
+    # ingestion engine resolver used by the phase gate). Mutable so the three
+    # truth-table rows can be exercised without re-importing cat_alog.
+    RESOLVED_INGESTION = {"name": "EfficientIngestionConfiguration"}
+
+    cat_factory = types.ModuleType("cat.services.factory")
+    cat_factory.__path__ = []
+    ingestion_factory = types.ModuleType("cat.services.factory.ingestion")
+
+    async def _fake_resolved_config_name(lizard):
+        return RESOLVED_INGESTION["name"]
+
+    ingestion_factory.resolved_config_name = _fake_resolved_config_name
+    cat_services.factory = cat_factory
+
     cat_plugins = types.ModuleType("cat.plugins")
 
     # Minimal `cat.db` surface used by the phase-path ingestion status reader.
@@ -135,6 +150,8 @@ if __name__ == "__main__":
     sys.modules["cat.services"] = cat_services
     sys.modules["cat.services.memory"] = cat_memory
     sys.modules["cat.services.memory.models"] = cat_memory_models
+    sys.modules["cat.services.factory"] = cat_factory
+    sys.modules["cat.services.factory.ingestion"] = ingestion_factory
     sys.modules["cat.plugins"] = cat_plugins
     sys.modules["cat.db"] = cat_db
     sys.modules["cat.db.crud"] = cat_db.crud
@@ -456,7 +473,7 @@ if __name__ == "__main__":
     ))
     cards_m = [d for d in out_m if d.metadata.get("is_catalogue_card") is True]
     assert len(cards_m) == 1, "(m) classic card missing"
-    assert cards_m[0].id == cat_alog._catalogue_card_point_id("report.pdf"), (
+    assert cards_m[0].id == cat_alog._catalogue_card_point_id("agent", classic_cat.id, "report.pdf"), (
         "(m) classic card does not use the shared deterministic id"
     )
 
@@ -536,9 +553,12 @@ if __name__ == "__main__":
         assert "FIRST CHUNK" in points_n[0].payload["metadata"]["full_card"], (
             "(n) initial page not taken from the smallest start_index chunk"
         )
-        assert points_n[0].id == cat_alog._catalogue_card_point_id("chat.pdf"), (
+        assert points_n[0].id == cat_alog._catalogue_card_point_id("agent", "chat1", "chat.pdf"), (
             "(n) first segment must use the shared deterministic id"
         )
+        assert all(
+            p.payload.get("id") == p.id for p in points_n
+        ), "(n) every card segment payload must carry its id (re-embed identity)"
         ids_n = [p.id for p in points_n]
         assert len(set(ids_n)) == len(ids_n), "(n) duplicate segment ids"
         assert "uuid4" not in repr(ids_n)
@@ -580,7 +600,10 @@ if __name__ == "__main__":
         assert "PAGE ONE CONTENT" in full_card_o, (
             "(o) initial page not read from the source file bytes"
         )
-        assert points_o[0].id == cat_alog._catalogue_card_point_id("lesson.txt")
+        assert points_o[0].id == cat_alog._catalogue_card_point_id("agent", None, "lesson.txt")
+        assert points_o[0].payload.get("id") == points_o[0].id, (
+            "(o) agent-scoped card payload must carry its id"
+        )
 
         # ── (p) Marker: LLM + sizes + prompt; cache tuning is NOT material ──
         LLM_SETTINGS["agent"] = {"name": "LLMConfig", "value": {"model": "gpt-x"}}
@@ -611,5 +634,63 @@ if __name__ == "__main__":
     finally:
         cat_alog._run_summary_agent = original_summary
         cat_alog._resolve_embedder = original_embedder
+
+    # ── (q) Truth table: EffING importable × SYSTEM engine -> gate ─────────
+    # Restored after 0a8633f deleted them. `_phase_machine_active` imports
+    # `cat.core_plugins.cat_efficient_ingestion.phases` lazily and resolves the
+    # SYSTEM ingestion engine; both are stubbed, so the three rows are pure.
+    phases_mod = types.ModuleType("cat.core_plugins.cat_efficient_ingestion.phases")
+    cat_core_phases_parent = sys.modules["cat.core_plugins.cat_efficient_ingestion"]
+    gate_cat = SimpleNamespace()
+
+    # (q1) EffING absent -> classic, regardless of the engine setting.
+    RESOLVED_INGESTION["name"] = "EfficientIngestionConfiguration"
+    sys.modules.pop("cat.core_plugins.cat_efficient_ingestion.phases", None)
+    assert asyncio.run(cat_alog._phase_machine_active(gate_cat)) is False, (
+        "(q1) absent EffING must keep the classic path"
+    )
+
+    # (q2) EffING present + CORE engine -> classic.
+    sys.modules["cat.core_plugins.cat_efficient_ingestion.phases"] = phases_mod
+    cat_core_phases_parent.phases = phases_mod
+    RESOLVED_INGESTION["name"] = "CoreIngestionConfiguration"
+    assert asyncio.run(cat_alog._phase_machine_active(gate_cat)) is False, (
+        "(q2) core engine must keep the classic path"
+    )
+
+    # (q3) EffING present + EFFICIENT engine -> phase path active.
+    RESOLVED_INGESTION["name"] = "EfficientIngestionConfiguration"
+    assert asyncio.run(cat_alog._phase_machine_active(gate_cat)) is True, (
+        "(q3) efficient engine must activate the phase path"
+    )
+    # Back to the classic path for the id-scoping checks below.
+    sys.modules.pop("cat.core_plugins.cat_efficient_ingestion.phases", None)
+
+    # ── (r) Tenant-scoped id: same source in two agents -> two distinct cards ─
+    def _classic_card(cat, source):
+        cat_alog.CATALOGUES.set(cat.agent_key, cat.id, source, "S")
+        out = asyncio.run(cat_alog.before_rabbithole_stores_documents(
+            [Document(page_content="chunk", metadata={"source": source})], cat,
+        ))
+        return [d for d in out if d.metadata.get("is_catalogue_card") is True][0]
+
+    agent_a = build_cat(with_file=True)
+    agent_a.agent_key = "agentA"
+    agent_b = build_cat(with_file=True)
+    agent_b.agent_key = "agentB"
+    card_a = _classic_card(agent_a, "same.pdf")
+    card_b = _classic_card(agent_b, "same.pdf")
+    assert card_a.id != card_b.id, "(r) same source in two agents must not collide"
+    assert card_a.id == cat_alog._catalogue_card_point_id("agentA", agent_a.id, "same.pdf")
+    assert card_b.id == cat_alog._catalogue_card_point_id("agentB", agent_b.id, "same.pdf")
+
+    # ── (s) Chat-scoped id: same source in two chats of one agent -> two cards ─
+    chat_1 = build_cat(with_file=True)
+    chat_1.id = "chatA"
+    chat_2 = build_cat(with_file=True)
+    chat_2.id = "chatB"
+    card_c1 = _classic_card(chat_1, "same.pdf")
+    card_c2 = _classic_card(chat_2, "same.pdf")
+    assert card_c1.id != card_c2.id, "(s) same source in two chats must not collide"
 
     print("test_catalog_phase: ALL ASSERTIONS PASSED")
