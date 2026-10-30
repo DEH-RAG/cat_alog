@@ -218,18 +218,45 @@ if __name__ == "__main__":
 
 
     class FakePhaseHandler:
-        """Collection-aware fake for the phase: separate chunks per collection."""
+        """Collection-aware fake for the phase: separate chunks per collection.
+
+        ``add_points_to_tenant`` stores what it receives (like the real upsert)
+        so the replace-on-re-run behaviour (delete old card points, then write
+        the new ones) is exercised against a realistic store.
+        """
 
         def __init__(self, by_collection):
-            self.by_collection = by_collection
+            self.by_collection = {name: list(records) for name, records in by_collection.items()}
             self.added = []
+            self.deleted = []
 
         async def get_all_tenant_points(self, collection_name, metadata=None,
                                         limit=None, offset=None, with_vectors=True):
-            return list(self.by_collection.get(collection_name, [])), None
+            records = self.by_collection.get(collection_name, [])
+            if metadata:
+                records = [
+                    r for r in records
+                    if all(
+                        ((r.payload or {}).get("metadata", {}) or {}).get(k) == v
+                        for k, v in metadata.items()
+                    )
+                ]
+            return list(records), None
 
         async def add_points_to_tenant(self, collection_name, points):
-            self.added.append((collection_name, list(points)))
+            points = list(points)
+            self.added.append((collection_name, points))
+            store = self.by_collection.setdefault(collection_name, [])
+            for point in points:
+                store.append(SimpleNamespace(id=point.id, payload=point.payload))
+
+        async def delete_tenant_points_by_ids(self, collection_name, points_ids):
+            ids = set(points_ids)
+            self.deleted.append((collection_name, ids))
+            store = self.by_collection.get(collection_name, [])
+            self.by_collection[collection_name] = [
+                r for r in store if getattr(r, "id", None) not in ids
+            ]
 
 
     class FakeCat:
@@ -685,6 +712,133 @@ if __name__ == "__main__":
         assert [p.id for p in handler_u.added[0][1]] == ids_u, (
             "(u) a re-run must reproduce the same segment ids"
         )
+
+        # ── (v) F2: a changed embedder window REPLACES the old segments ──────
+        # Same source, same chat: a lower/higher window yields a different
+        # segment count, so the phase must delete the source's old card points
+        # instead of leaving them next to the new ones. Other sources and other
+        # chats must stay untouched.
+        class FakeWindowEmbedder(FakeEmbedder):
+            def __init__(self, max_tokens):
+                super().__init__(max_tokens)
+
+        window_embedder = FakeWindowEmbedder(37)
+
+        async def _window_embedder(cat):
+            return window_embedder
+
+        cat_alog._resolve_embedder = _window_embedder
+        handler_v = FakePhaseHandler({
+            DEC: [
+                SimpleNamespace(payload={
+                    "page_content": "WIN CHUNK",
+                    "metadata": {"source": "win.txt", "start_index": 0},
+                }),
+                SimpleNamespace(payload={
+                    "page_content": "OTHER CHUNK",
+                    "metadata": {"source": "other.txt", "start_index": 0},
+                }),
+            ],
+            EPS: [SimpleNamespace(payload={
+                "page_content": "CHAT CHUNK",
+                "metadata": {"source": "win.txt", "chat_id": "chatZ", "start_index": 0},
+            })],
+        })
+        fm_v = FakeFileManager([], files={
+            ("agent", "win.txt"): b"WIN PAGE " * 400,
+            ("agent", "other.txt"): b"OTHER PAGE " * 20,
+            ("agent/chatZ", "win.txt"): b"CHAT PAGE " * 200,
+        })
+        cat_v = FakeCat(fm_v, handler_v, {})
+        cat_alog._run_summary_agent = _fake_summary_agent
+
+        def _cards_v(collection):
+            return [
+                r for r in handler_v.by_collection.get(collection, [])
+                if ((r.payload or {}).get("metadata", {}) or {}).get("is_catalogue_card") is True
+            ]
+
+        def _card_ids_v(collection, chat_id, source="win.txt"):
+            return sorted(
+                r.id for r in _cards_v(collection)
+                if ((r.payload or {}).get("metadata", {}) or {}).get("chat_id") == chat_id
+                and ((r.payload or {}).get("metadata", {}) or {}).get("source") == source
+            )
+
+        # A third source's card, produced before the window changes.
+        asyncio.run(
+            cat_alog.ingestion_phase_run("catalog_cards", "other.txt", {}, cat_v)
+        )
+        other_ids_before = _card_ids_v(DEC, None, source="other.txt")
+        assert other_ids_before, "(v) other source card was not produced"
+
+        def _run_win():
+            handler_v.added.clear()
+            handler_v.deleted.clear()
+            result = asyncio.run(
+                cat_alog.ingestion_phase_run("catalog_cards", "win.txt", {}, cat_v)
+            )
+            assert result == {"status": "done"}, "(v) phase did not finish"
+            return {collection: list(points) for collection, points in handler_v.added}
+
+        first = _run_win()
+        first_dec_ids = sorted(p.id for p in first[DEC])
+        first_eps_ids = sorted(p.id for p in first[EPS])
+        assert len(first_dec_ids) > 1, "(v) window 37 did not segment the card"
+
+        # LOWER the window -> MORE segments, all ids new.
+        window_embedder.max_input_tokens = 23
+        second = _run_win()
+        second_dec_ids = sorted(p.id for p in second[DEC])
+        second_eps_ids = sorted(p.id for p in second[EPS])
+        assert len(second_dec_ids) > len(first_dec_ids), (
+            "(v) lowering the window must produce more segments",
+            len(first_dec_ids), len(second_dec_ids),
+        )
+        # start_index 0 keeps the classic (suffix-less) id by design; every
+        # other old segment id must be gone.
+        base_dec_id = cat_alog._catalogue_card_point_id("agent", None, "win.txt")
+        assert base_dec_id in second_dec_ids
+        assert set(first_dec_ids) - set(second_dec_ids), (
+            "(v) lower window kept the old segment ids"
+        )
+        assert _card_ids_v(DEC, None) == second_dec_ids, (
+            "(v) old agent-scoped segments survived the lower-window re-run",
+            _card_ids_v(DEC, None), second_dec_ids,
+        )
+        assert _card_ids_v(EPS, "chatZ") == second_eps_ids, (
+            "(v) old chat-scoped segments survived the lower-window re-run"
+        )
+        assert _card_ids_v(DEC, None) and _card_ids_v(EPS, "chatZ"), (
+            "(v) a re-run must not delete everything"
+        )
+
+        # RAISE the window -> FEWER segments (one whole card), old ones gone.
+        window_embedder.max_input_tokens = 3000
+        third = _run_win()
+        third_dec_ids = sorted(p.id for p in third[DEC])
+        third_eps_ids = sorted(p.id for p in third[EPS])
+        assert len(third_dec_ids) < len(second_dec_ids), (
+            "(v) raising the window must produce fewer segments"
+        )
+        assert _card_ids_v(DEC, None) == third_dec_ids, (
+            "(v) old agent-scoped segments survived the higher-window re-run"
+        )
+        assert _card_ids_v(EPS, "chatZ") == third_eps_ids, (
+            "(v) old chat-scoped segments survived the higher-window re-run"
+        )
+        assert base_dec_id in third_dec_ids, (
+            "(v) the start_index-0 segment must keep the classic id"
+        )
+        assert set(second_dec_ids) - set(third_dec_ids), (
+            "(v) higher window kept the old segment ids"
+        )
+
+        # Other sources are untouched by every re-run of win.txt.
+        assert sorted(
+            r.id for r in _cards_v(DEC)
+            if ((r.payload or {}).get("metadata", {}) or {}).get("source") == "other.txt"
+        ) == other_ids_before, "(v) a different source's card was deleted/replaced"
 
         # ── (p) Marker: LLM + sizes + prompt; cache tuning is NOT material ──
         LLM_SETTINGS["agent"] = {"name": "LLMConfig", "value": {"model": "gpt-x"}}

@@ -400,6 +400,42 @@ def _segment_card(card: str, card_metadata: Dict, embedder) -> list:
     return segments
 
 
+async def _purge_existing_cards(handler, collection, source: str, chat_id, log_prefix: str) -> int:
+    """Delete every stored card point of ``source`` in ``collection`` for ``chat_id``.
+
+    A re-run of the ``catalog_cards`` phase can produce a DIFFERENT number of
+    segments when the embedder window changed: the ids derive from
+    ``start_index``, so the new ids do not address the stored ones and the old
+    segments would survive next to the new card. Removing the source's cards in
+    THIS collection and THIS chat first makes the write idempotent regardless
+    of the previous segmentation.
+
+    Scoped strictly to the source + ``is_catalogue_card`` + the exact
+    ``chat_id``: other sources (and other conversations, including the
+    agent-scoped ``None`` group) are never touched. The tenant is enforced by
+    the handler itself.
+    """
+    records, _ = await handler.get_all_tenant_points(
+        collection,
+        metadata={"source": source, "is_catalogue_card": True},
+        with_vectors=False,
+    )
+    stale_ids = []
+    for record in records or []:
+        meta = (record.payload or {}).get("metadata", {}) or {}
+        if meta.get("is_catalogue_card") is not True:
+            continue
+        if meta.get("chat_id") != chat_id:
+            continue
+        point_id = getattr(record, "id", None) or (record.payload or {}).get("id")
+        if point_id is not None:
+            stale_ids.append(point_id)
+    if stale_ids:
+        await handler.delete_tenant_points_by_ids(collection, stale_ids)
+        log.info(f"{log_prefix}: replaced {len(stale_ids)} stale card segment(s)")
+    return len(stale_ids)
+
+
 async def _agent_llm_identity(cat) -> str:
     """Stable, secret-free identity of the agent's configured LLM.
 
@@ -579,6 +615,14 @@ async def ingestion_phase_run(phase, source, completed_phases, cat) -> Any:
                     vector=vector,
                 )
             )
+        # A re-run with a changed embedder window re-splits the card into a
+        # different segment count, so the start_index-derived ids do not match
+        # the stored ones. Replace this source's cards in THIS collection/chat
+        # first: the write is then idempotent and one source never ends up with
+        # two cards.
+        await _purge_existing_cards(
+            handler, collection, source, chat_id, "cat_alog"
+        )
         await handler.add_points_to_tenant(collection, points=card_points)
 
         log.info(
