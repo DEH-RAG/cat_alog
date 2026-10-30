@@ -88,6 +88,30 @@ if __name__ == "__main__":
 
     cat_plugins = types.ModuleType("cat.plugins")
 
+    # Minimal `cat.db` surface used by the phase-path ingestion status reader.
+    # Tests swap the row maps below; defaults are inert.
+    import types as _types
+
+    INGESTION_ROWS = {}
+    INGESTION_KEYS = []
+
+
+    async def _fake_get_ingestion_status_keys(agent_id):
+        return list(INGESTION_KEYS)
+
+
+    async def _fake_crud_read(key):
+        return INGESTION_ROWS.get(key)
+
+
+    cat_db = _types.ModuleType("cat.db")
+    cat_db.crud = _types.ModuleType("cat.db.crud")
+    cat_db.crud.read = _fake_crud_read
+    cat_db_cruds = _types.ModuleType("cat.db.cruds")
+    cat_db_settings = _types.ModuleType("cat.db.cruds.settings")
+    cat_db_settings.get_ingestion_status_keys = _fake_get_ingestion_status_keys
+    cat_db_cruds.settings = cat_db_settings
+
     sys.modules["pydantic"] = pydantic_mod
     sys.modules["langchain_core"] = types.ModuleType("langchain_core")
     sys.modules["langchain_core.documents"] = types.ModuleType("langchain_core.documents")
@@ -98,6 +122,10 @@ if __name__ == "__main__":
     sys.modules["cat.services.memory"] = cat_memory
     sys.modules["cat.services.memory.models"] = cat_memory_models
     sys.modules["cat.plugins"] = cat_plugins
+    sys.modules["cat.db"] = cat_db
+    sys.modules["cat.db.crud"] = cat_db.crud
+    sys.modules["cat.db.cruds"] = cat_db_cruds
+    sys.modules["cat.db.cruds.settings"] = cat_db_settings
 
     sys.path.insert(0, "/root/git/plugins/cat_alog")
     import cat_alog  # noqa: E402
@@ -118,9 +146,11 @@ if __name__ == "__main__":
 
         def __init__(self, records):
             self.records = records
+            self.calls = 0
 
         async def get_all_tenant_points(self, collection_name, metadata=None,
                                         limit=None, offset=None, with_vectors=True):
+            self.calls += 1
             return list(self.records), None
 
 
@@ -134,15 +164,32 @@ if __name__ == "__main__":
             return []
 
 
+    class FakePlugin:
+        def __init__(self, settings):
+            self._settings = settings
+
+        async def load_settings(self):
+            return dict(self._settings)
+
+
+    class FakePluginManager:
+        def __init__(self, settings):
+            self._settings = settings
+
+        def get_plugin(self):
+            return FakePlugin(self._settings)
+
+
     class FakeCat:
-        def __init__(self, file_manager, handler):
+        def __init__(self, file_manager, handler, settings=None):
             self.agent_key = "agent"
             self.id = "chat"
             self.file_manager = file_manager
             self.vector_memory_handler = handler
+            self.plugin_manager = FakePluginManager(settings or {})
 
 
-    def build_cat(with_file=True):
+    def build_cat(with_file=True, settings=None):
         agent_files = (
             [SimpleNamespace(name="report.pdf", last_modified=1234567890.0)]
             if with_file
@@ -157,7 +204,9 @@ if __name__ == "__main__":
             },
         }
         records = [SimpleNamespace(payload=card_payload)] if with_file else []
-        return FakeCat(FakeFileManager(agent_files), FakeVectorMemoryHandler(records))
+        return FakeCat(
+            FakeFileManager(agent_files), FakeVectorMemoryHandler(records), settings
+        )
 
 
     cat = build_cat(with_file=True)
@@ -260,5 +309,107 @@ if __name__ == "__main__":
         with_previews=False,
     )
     assert "uploaded unknown" in compact_i, "(i) falsy when not normalized to unknown"
+
+    # ── (j) Setting OFF: prompt untouched and NO collection / DB / vector call ─
+    off_cat = build_cat(
+        with_file=True, settings={"append_file_list_to_prompt": False}
+    )
+    original_collect_j = cat_alog._collect_loaded_files
+
+    async def _must_not_collect(cat):
+        raise AssertionError("collector must not run when the setting is off")
+
+    try:
+        cat_alog._collect_loaded_files = _must_not_collect
+        out_j = asyncio.run(cat_alog.agent_prompt_suffix("KEEP", off_cat))
+    finally:
+        cat_alog._collect_loaded_files = original_collect_j
+    assert out_j == "KEEP", "(j) setting off must leave the prompt untouched"
+    assert off_cat.vector_memory_handler.calls == 0, "(j) no vector query when off"
+
+    # ── (k) Setting ON + phase path: list comes from ingestion status rows ──
+    INGESTION_KEYS[:] = [
+        "agents:agent:ingestion:agent:aaa",
+        "agents:agent:ingestion:agent:bbb",
+        "agents:agent:ingestion:agent:aaa-dup",
+        "agents:agent:ingestion:delete",
+        "agents:agent:ingestion:chat:zzz",
+    ]
+    INGESTION_ROWS.clear()
+    INGESTION_ROWS.update({
+        "agents:agent:ingestion:agent:aaa": {
+            "source": "lesson1.pdf", "scope": "agent", "type": "file",
+            "status": "completed", "updated_at": 1234567890.0,
+        },
+        "agents:agent:ingestion:agent:bbb": {
+            "source": "https://example.test/slides", "scope": "agent", "type": "url",
+            "status": "completed", "updated_at": 1234567890.0,
+        },
+        # Same source again (e.g. re-ingested row): must NOT duplicate.
+        "agents:agent:ingestion:agent:aaa-dup": {
+            "source": "lesson1.pdf", "scope": "agent", "type": "file",
+            "status": "error", "updated_at": 1234567890.0,
+        },
+        "agents:agent:ingestion:delete": {"delete_marker": True},
+        "agents:agent:ingestion:chat:zzz": {
+            "source": "chatfile.pdf", "scope": "chat", "type": "file",
+            "status": "completed", "updated_at": 1234567890.0,
+        },
+    })
+    phase_cat = build_cat(with_file=True)
+    original_phase_k = cat_alog._phase_machine_active
+
+    async def _phase_on(cat=None):
+        return True
+
+    try:
+        cat_alog._phase_machine_active = _phase_on
+        out_k = asyncio.run(cat_alog.agent_prompt_suffix("x", phase_cat))
+    finally:
+        cat_alog._phase_machine_active = original_phase_k
+    assert "lesson1.pdf" in out_k, "(k) status source missing from list"
+    assert out_k.count("lesson1.pdf") == 1, "(k) duplicate source listed twice"
+    assert "https://example.test/slides" in out_k, "(k) URL source missing"
+    assert "chatfile.pdf" not in out_k, "(k) non-AGENT-scope row leaked"
+    assert "delete" not in out_k.lower(), "(k) deletion marker listed as a file"
+    assert phase_cat.vector_memory_handler.calls == 0, (
+        "(k) phase path must not run the classic vector collector"
+    )
+
+    # ── (l) Extracted image never listed; whole-image source stays ──────────
+    image_records = [
+        SimpleNamespace(payload={"metadata": {
+            "source": "original.pdf", "image": True,
+            "image_file": "original_img_0_abcd.jpg",
+        }}),
+        SimpleNamespace(payload={"metadata": {
+            "source": "photo.jpg", "image": True,
+            "image_file": "photo.jpg",
+        }}),
+    ]
+    img_cat = FakeCat(
+        FakeFileManager([
+            SimpleNamespace(name="original.pdf", last_modified=1.0),
+            SimpleNamespace(name="original_img_0_abcd.jpg", last_modified=1.0),
+            SimpleNamespace(name="photo.jpg", last_modified=1.0),
+        ]),
+        FakeVectorMemoryHandler(image_records),
+        {},
+    )
+    original_phase_l = cat_alog._phase_machine_active
+
+    async def _phase_off(cat=None):
+        return False
+
+    try:
+        cat_alog._phase_machine_active = _phase_off
+        out_l = asyncio.run(cat_alog.agent_prompt_suffix("x", img_cat))
+    finally:
+        cat_alog._phase_machine_active = original_phase_l
+    assert "original_img_0_abcd.jpg" not in out_l, (
+        "(l) image extracted from a file was listed"
+    )
+    assert "original.pdf" in out_l, "(l) the source file itself disappeared"
+    assert "photo.jpg" in out_l, "(l) an image that IS the source must stay"
 
     print("test_catalog_phase: ALL ASSERTIONS PASSED")

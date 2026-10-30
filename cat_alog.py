@@ -30,6 +30,13 @@ class CatAlogSettings(BaseModel):
         default=100,
         description="Maximum number of entries in the LRU cache."
     )
+    append_file_list_to_prompt: bool = Field(
+        default=True,
+        description=(
+            "Append the list of files loaded in the agent (and conversation) to "
+            "the end of the system prompt. When False the prompt is left untouched."
+        )
+    )
 
 
 @plugin
@@ -621,7 +628,96 @@ async def _collect_loaded_files(cat) -> Dict[str, Dict[str, Any]]:
     await add_legacy_fallback(str(VectorMemoryType.DECLARATIVE), is_episodic=False)
     await add_legacy_fallback(str(VectorMemoryType.EPISODIC), is_episodic=True)
 
+    # An image extracted from a source file is SAVED as a file by the
+    # multimodal-ingestion plugin, so the FileManager phase above lists it as a
+    # file even though it is a derived artifact, never a source. Drop it.
+    for image_file in await _derived_image_files(cat):
+        files_dict.pop(image_file, None)
+
     return files_dict
+
+
+async def _derived_image_files(cat) -> set:
+    """Names of image files EXTRACTED from a source (derived, never sources).
+
+    The multimodal-ingestion plugin stores every extracted image as a vector
+    point whose metadata carries ``image is True`` and the saved file name in
+    ``image_file``; the point also keeps the ORIGINAL source in ``source``.
+    A point is a derived image iff its ``image_file`` differs from its
+    ``source``: a source that is itself an image is stored whole with
+    ``image_file == source`` and must stay listable.
+    """
+    derived: set = set()
+    handler = getattr(cat, "vector_memory_handler", None)
+    if handler is None:
+        return derived
+    for collection in (str(VectorMemoryType.DECLARATIVE), str(VectorMemoryType.EPISODIC)):
+        try:
+            records, _ = await handler.get_all_tenant_points(
+                collection, metadata={"image": True}, with_vectors=False,
+            )
+        except Exception:
+            log.debug(f"cat_alog: image query for {collection} not supported, skipping")
+            continue
+        for record in records or []:
+            meta = (record.payload or {}).get("metadata", {}) or {}
+            if meta.get("image") is not True:
+                continue
+            image_file = meta.get("image_file")
+            source = meta.get("source")
+            if image_file and image_file != source:
+                derived.add(image_file)
+    return derived
+
+
+async def _collect_ingestion_sources(cat) -> Dict[str, Dict[str, Any]]:
+    """Phase-path file list: the agent's ingestion status rows are the sources.
+
+    With the EffING phase machine active the status registry is the ground
+    truth of what has been ingested: one row per ingested SOURCE (file or URL),
+    AGENT scope. Rows only ever describe sources, so images extracted from a
+    file have no row and cannot leak into the list; duplicates are impossible
+    because the dict is keyed by source (a source without a catalogue card
+    still appears exactly once).
+    """
+    files: Dict[str, Dict[str, Any]] = {}
+    try:
+        from cat.db import crud
+        from cat.db.cruds import settings as crud_settings
+    except Exception as e:  # noqa: BLE001 - host without the status API
+        log.warning(f"cat_alog: ingestion status API unavailable ({e!r})")
+        return files
+
+    agent_id = cat.agent_key
+    try:
+        keys = await crud_settings.get_ingestion_status_keys(agent_id)
+    except Exception as e:  # noqa: BLE001 - best-effort list, never breaks the turn
+        log.warning(f"cat_alog: could not list ingestion status keys: {e!r}")
+        return files
+
+    for key in keys or []:
+        # The deletion marker shares the namespace and is not a status row.
+        if str(key).rsplit(":", 1)[-1] == "delete":
+            continue
+        try:
+            doc = await crud.read(key)
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(doc, list):
+            doc = doc[0] if doc else None
+        if not isinstance(doc, dict):
+            continue
+        source = doc.get("source")
+        if not source or doc.get("scope") != "agent":
+            continue
+        when = doc.get("updated_at") or doc.get("created_at")
+        files[source] = {
+            "source": source,
+            "when": when,
+            "content": None,
+            "type": "agent",
+        }
+    return files
 
 
 def _format_loaded_files(files_dict, with_previews: bool = False) -> str:
@@ -660,9 +756,28 @@ def _format_loaded_files(files_dict, with_previews: bool = False) -> str:
 
 @hook(priority=10)
 async def agent_prompt_suffix(prompt_suffix: str, cat) -> str:
-    """Append the list of files loaded in the agent and conversation to the end of the system prompt."""
+    """Append the list of files loaded in the agent and conversation to the end of the system prompt.
+
+    ``append_file_list_to_prompt`` is the master switch: when it is False the
+    prompt is returned untouched and no file collection (no DB/vector query) is
+    performed. When it is True the list is status-first — the EffING phase path
+    builds it from the agent's ingestion-status rows, the classic path from the
+    FileManager + vector query collector. Derived images never appear in either.
+    """
     try:
-        files = await _collect_loaded_files(cat)
+        settings = await cat.plugin_manager.get_plugin().load_settings()
+    except Exception as e:  # noqa: BLE001 - default ON, never break the turn
+        log.warning(f"cat_alog: could not load settings for prompt suffix ({e!r})")
+        settings = {}
+    settings = settings or {}
+    if not bool(settings.get("append_file_list_to_prompt", True)):
+        return prompt_suffix
+
+    try:
+        if await _phase_machine_active(cat):
+            files = await _collect_ingestion_sources(cat)
+        else:
+            files = await _collect_loaded_files(cat)
     except Exception as e:
         log.warning(f"cat_alog: agent_prompt_suffix could not collect loaded files: {e}")
         return prompt_suffix
