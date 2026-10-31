@@ -568,6 +568,45 @@ async def ingestion_phase_run(phase, source, completed_phases, cat) -> Any:
         return _phase_failure_status(exc)
 
 
+@hook(priority=10)
+async def ingestion_phase_purge(phase, source, cat) -> Any:
+    """Purge the catalogue-card points of ``source`` (phase purge hook).
+
+    EffING calls this before re-running an abandoned (expired-lease)
+    ``catalog_cards`` phase. Deletes ONLY this source's catalogue-card points
+    across ALL segments and BOTH collections (declarative + episodic), scoped
+    by ``is_catalogue_card`` so the source's chunks, images, graph artifacts
+    and every other source are untouched. Returns a truthy status dict after
+    purging, and ``None`` for phases this plugin does not implement.
+    """
+    if phase != "catalog_cards":
+        return None
+    handler = cat.vector_memory_handler
+    removed = 0
+    for collection in (
+        str(VectorMemoryType.DECLARATIVE),
+        str(VectorMemoryType.EPISODIC),
+    ):
+        records, _ = await handler.get_all_tenant_points(
+            collection,
+            metadata={"source": source, "is_catalogue_card": True},
+            with_vectors=False,
+        )
+        stale_ids = []
+        for record in records or []:
+            meta = (record.payload or {}).get("metadata", {}) or {}
+            if meta.get("is_catalogue_card") is not True:
+                continue
+            point_id = getattr(record, "id", None) or (record.payload or {}).get("id")
+            if point_id is not None:
+                stale_ids.append(point_id)
+        if stale_ids:
+            await handler.delete_tenant_points_by_ids(collection, stale_ids)
+            removed += len(stale_ids)
+    log.info(f"cat_alog: purged {removed} catalogue-card segment(s) for '{source}'")
+    return {"status": "done", "purged": removed}
+
+
 async def _run_catalog_cards_phase(source, cat) -> Dict[str, Any]:
     settings = await cat.plugin_manager.get_plugin().load_settings()
     settings = settings or {}
