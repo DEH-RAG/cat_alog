@@ -510,6 +510,36 @@ async def ingestion_phase_settings_marker(phase, cat) -> Any:
     return hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()
 
 
+_TRANSIENT_ERROR_MARKERS = (
+    "Timeout",
+    "ConnectionError",
+    "ConnectError",
+    "RateLimit",
+    "ServiceUnavailable",
+)
+
+
+def _is_transient_phase_error(exc: BaseException) -> bool:
+    """True only for failures that a bounded retry can plausibly fix.
+
+    A timeout / connection reset / rate limit is retryable; a 404 or a
+    model-not-found is permanent. Class-name matching avoids importing the
+    provider SDK just to classify its exceptions.
+    """
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    name = type(exc).__name__
+    return any(marker in name for marker in _TRANSIENT_ERROR_MARKERS)
+
+
+def _phase_failure_status(exc: BaseException) -> Dict[str, Any]:
+    """Map an exception to a status dict: transient -> not_ready, else error."""
+    reason = f"{type(exc).__name__}: {exc}".strip()[:500]
+    if _is_transient_phase_error(exc):
+        return {"status": "not_ready", "retry_after": 5, "reason": reason}
+    return {"status": "error", "reason": reason}
+
+
 @hook(priority=10)
 async def ingestion_phase_run(phase, source, completed_phases, cat) -> Any:
     """Run the ``catalog_cards`` phase for ``source`` (tri-state contract).
@@ -517,14 +547,28 @@ async def ingestion_phase_run(phase, source, completed_phases, cat) -> Any:
     - ``{"status": "done"}``: the card was embedded and stored as a vector
       point with ``is_catalogue_card: True`` + ``full_card`` metadata;
     - ``{"status": "not_ready", "retry_after": 5}``: the source has no stored
-      points yet (parsing/embedding not done) — retry later;
-    - raise: permanent failure (fail-hard -> ERROR);
-    - ``None`` for unknown phases (fail-hard: a phase nobody implements is an
-      error, never a silent success).
+      points yet, or the failure is transient (timeout/connection) — retry
+      later;
+    - ``{"status": "error", "reason": "..."}``: permanent failure (e.g. a 404 /
+      model not found) — the machine marks the phase ERROR;
+    - ``None`` for phases this plugin does not implement (hook abstention: the
+      dispatcher keeps the value produced by the phase's real owner).
     """
     if phase != "catalog_cards":
         return None
+    try:
+        return await _run_catalog_cards_phase(source, cat)
+    except Exception as exc:  # noqa: BLE001 - a phase failure is a status, never a raise
+        # Log ONCE, here: re-raising would be swallowed by the hook dispatcher
+        # (which then hands the phase id back as the result).
+        log.error(
+            f"cat_alog: phase catalog_cards failed for '{source}': "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return _phase_failure_status(exc)
 
+
+async def _run_catalog_cards_phase(source, cat) -> Dict[str, Any]:
     settings = await cat.plugin_manager.get_plugin().load_settings()
     settings = settings or {}
     max_document_chars = int(settings.get("max_document_chars", 8000))

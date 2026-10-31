@@ -928,4 +928,47 @@ if __name__ == "__main__":
     card_c2 = _classic_card(chat_2, "same.pdf")
     assert card_c1.id != card_c2.id, "(s) same source in two chats must not collide"
 
+    # ── (u) Phase failure -> status dict, never the phase id ─────────────
+    class NotFoundError(Exception):
+        pass
+
+    async def _raise_not_found(cat, prompt):
+        raise NotFoundError("model gpt-x not found (404)")
+
+    handler_u = FakePhaseHandler({DEC: [SimpleNamespace(payload={
+        "page_content": "CHUNK BODY",
+        "metadata": {"source": "bad.pdf", "start_index": 0},
+    })]})
+    cat_u = FakeCat(FakeFileManager([]), handler_u, {})
+
+    async def _embedder_u(cat):
+        return FakeEmbedder(None)
+
+    original_summary_u = cat_alog._run_summary_agent
+    original_embedder_u = cat_alog._resolve_embedder
+    original_log_error_u = cat_alog.log.error
+    logged_u = []
+    cat_alog._run_summary_agent = _raise_not_found
+    cat_alog._resolve_embedder = _embedder_u
+    cat_alog.log.error = lambda msg, *a, **k: logged_u.append(str(msg))
+    try:
+        result_u = asyncio.run(
+            cat_alog.ingestion_phase_run("catalog_cards", "bad.pdf", {}, cat_u)
+        )
+    finally:
+        cat_alog._run_summary_agent = original_summary_u
+        cat_alog._resolve_embedder = original_embedder_u
+        cat_alog.log.error = original_log_error_u
+
+    assert isinstance(result_u, dict), "(u) failure must return a status dict"
+    assert result_u.get("status") == "error", "(u) permanent failure must be error"
+    assert result_u.get("reason"), "(u) error status must carry a reason"
+    assert "NotFoundError" in result_u["reason"], "(u) reason must name the exception"
+    assert result_u != "catalog_cards", "(u) phase id leaked as the result"
+    assert logged_u, "(u) phase failure was not logged"
+    assert "catalog_cards" in logged_u[0], "(u) log line must carry the phase id"
+    assert "NotFoundError" in logged_u[0], "(u) log line must carry the exception class"
+    assert len(logged_u) == 1, "(u) phase failure must be logged exactly once"
+    assert not handler_u.added, "(u) a failed phase must not write a card"
+
     print("test_catalog_phase: ALL ASSERTIONS PASSED")
