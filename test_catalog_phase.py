@@ -1045,7 +1045,10 @@ if __name__ == "__main__":
         "CatalogCardsPhase must subclass the canonical IngestionPhase"
     )
 
-    # (abc-a) Catalogue-disabled agent -> applies_to False -> skipped.
+    # (abc-a) applies_to is a CAPABILITY check only: the catalogue has no
+    # per-agent enable flag, so the phase always applies. The engine gate
+    # (EffING installed AND efficient engine) is EffING's decision, never
+    # re-derived inside the phase class.
     catalogue_off = build_cat(with_file=True)
     phase_a = cat_alog.CatalogCardsPhase(catalogue_off)
     original_gate_a = cat_alog._phase_machine_active
@@ -1063,20 +1066,37 @@ if __name__ == "__main__":
         )
     finally:
         cat_alog._phase_machine_active = original_gate_a
-    assert applies_off is False, "(abc-a) a disabled catalogue must not apply"
-    assert reason_off, "(abc-a) skipped phase must carry a reason"
+    assert applies_off is True and reason_off is None, (
+        "(abc-a) applies_to must not re-implement the engine gate"
+    )
     cat_alog._phase_machine_active = _gate_on
     try:
         applies_on, reason_on = asyncio.run(phase_a.applies_to(catalogue_off, {}))
     finally:
         cat_alog._phase_machine_active = original_gate_a
     assert applies_on is True and reason_on is None, (
-        "(abc-a) an enabled catalogue must apply without a reason"
+        "(abc-a) the catalogue capability applies without a reason"
     )
     registered = cat_alog.ingestion_phase_objects(cat=catalogue_off)
     assert len(registered) == 1 and isinstance(
         registered[0], cat_alog.CatalogCardsPhase
     ), "(abc-a) the phase must be registered through ingestion_phase_objects"
+
+    # (abc-a2) The phase class must NOT own the ingestion protocol: no diary,
+    # staleness, lock, retry or status-derivation helper may be referenced.
+    import inspect as _inspect
+
+    class_source = _inspect.getsource(cat_alog.CatalogCardsPhase)
+    for forbidden in (
+        "record_phase_",
+        "should_abandon",
+        "distributed_lock",
+        "derive_source_status",
+        "_phase_machine_active",
+    ):
+        assert forbidden not in class_source, (
+            f"(abc-a2) phase class must not reference protocol helper {forbidden!r}"
+        )
 
     # (abc-b) delete() removes ONLY the source's cards and is idempotent.
     handler_b = FakePhaseHandler({

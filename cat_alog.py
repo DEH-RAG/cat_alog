@@ -577,18 +577,28 @@ async def ingestion_phase_run(phase, source, completed_phases, cat) -> Any:
     - ``None`` for phases this plugin does not implement (hook abstention: the
       dispatcher keeps the value produced by the phase's real owner).
     """
-    if phase != "catalog_cards":
+    if phase != "catalog_cards" or CatalogCardsPhase is None:
         return None
-    try:
-        return await _run_catalog_cards_phase(source, cat)
-    except Exception as exc:  # noqa: BLE001 - a phase failure is a status, never a raise
-        # Log ONCE, here: re-raising would be swallowed by the hook dispatcher
-        # (which then hands the phase id back as the result).
-        log.error(
-            f"cat_alog: phase catalog_cards failed for '{source}': "
-            f"{type(exc).__name__}: {exc}"
-        )
-        return _phase_failure_status(exc)
+    # Thin delegation: the phase class owns the work and its status mapping.
+    return _phase_result_as_status(
+        await CatalogCardsPhase(cat).process(source, cat)
+    )
+
+
+def _phase_result_as_status(result: Any) -> Any:
+    """Translate a class ``PhaseResult`` back to the legacy status-dict contract.
+
+    The legacy hook dispatcher (EffING ``_run_external_phase``) still expects a
+    status dict, so the thin hook adapts the class result at the boundary
+    instead of re-implementing the run logic. ``retry_after`` is not carried by
+    ``PhaseResult``; the engine's default (5s) matches the previous value.
+    """
+    if _PhaseResult is not None and isinstance(result, _PhaseResult):
+        status = {"status": result.status}
+        if result.reason is not None:
+            status["reason"] = result.reason
+        return status
+    return result
 
 
 async def _delete_source_catalogue_cards(cat, source: str) -> int:
@@ -635,11 +645,11 @@ async def ingestion_phase_purge(phase, source, cat) -> Any:
     and every other source are untouched. Returns a truthy status dict after
     purging, and ``None`` for phases this plugin does not implement.
     """
-    if phase != "catalog_cards":
+    if phase != "catalog_cards" or CatalogCardsPhase is None:
         return None
-    removed = await _delete_source_catalogue_cards(cat, source)
-    log.info(f"cat_alog: purged {removed} catalogue-card segment(s) for '{source}'")
-    return {"status": "done", "purged": removed}
+    # Thin delegation: the phase class owns its source-scoped delete.
+    await CatalogCardsPhase(cat).delete(source, cat)
+    return {"status": "done"}
 
 
 async def _run_catalog_cards_phase(source, cat) -> Dict[str, Any]:
@@ -779,10 +789,12 @@ if _IngestionPhase is not None:
     class CatalogCardsPhase(_IngestionPhase):
         """The ``catalog_cards`` ingestion phase as an EffING phase object.
 
-        Owns the applicability gate, the phase body (delegated to the SAME
-        card-generation path the legacy hook uses) and a source-scoped
-        ``delete``. Registered through ``ingestion_phase_objects``; the legacy
-        hooks stay in place for one release, but EffING now sees this class.
+        Owns only the phase body (delegated to the SAME card-generation path
+        the legacy hook uses), a source-scoped ``delete`` and the configuration
+        fingerprint. No diary/state/lock/retry logic and no engine gate: the
+        phase protocol belongs to EffING. Registered through
+        ``ingestion_phase_objects``; the legacy hooks are thin delegations to
+        these methods.
         """
 
         id = "catalog_cards"
@@ -798,23 +810,15 @@ if _IngestionPhase is not None:
             self._cat = cat
 
         async def applies_to(self, cat, deps_state) -> Tuple[bool, Optional[str]]:
-            """Apply only on the EffING phase path (classic hooks otherwise).
+            """Capability check only: is the catalogue enabled for this agent?
 
-            ``_phase_machine_active`` is the single source of truth for which
-            implementation owns card generation. When it is false the classic
-            ``before_rabbithole_*`` hooks produce the cards, so the phase is
-            reported ``skipped`` (with a reason) instead of staying ``pending``.
+            The catalogue has no per-agent enable flag (its plugin settings are
+            global tuning, not an on/off switch), and this phase object only
+            exists when EffING is importable. Whether the phase machinery is
+            actually active is the ENGINE's decision, computed and owned by
+            EffING — never re-derived here.
             """
-            used = cat if cat is not None else self._cat
-            if used is None:
-                return False, "no catcher instance to evaluate the catalogue phase"
-            if await _phase_machine_active(used):
-                return True, None
-            return (
-                False,
-                "catalogue cards are handled by the classic hooks "
-                "(EffING phase path not active for this agent)",
-            )
+            return True, None
 
         async def process(self, source: str, cat):
             """Delegate to the EXISTING card-generation path (no reimplementation)."""
