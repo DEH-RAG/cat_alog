@@ -1099,37 +1099,45 @@ if __name__ == "__main__":
         )
 
     # (abc-b) delete() removes ONLY the source's cards and is idempotent.
+    del_dec_id = cat_alog._catalogue_card_point_id("agent", "chat", "del.pdf")
+    keep_dec_id = cat_alog._catalogue_card_point_id("agent", "chat", "keep.pdf")
+    del_chunk_id = "stale-card-on-chunk"
+    del_eps_id = cat_alog._catalogue_card_point_id("agent", "chat", "del.pdf")
+    keep_eps_id = cat_alog._catalogue_card_point_id("agent", "chat", "keep.pdf")
     handler_b = FakePhaseHandler({
         DEC: [
             SimpleNamespace(
-                id="del-dec",
+                id=del_dec_id,
                 payload={"metadata": {
                     "source": "del.pdf", "is_catalogue_card": True,
                     "chat_id": "chat",
                 }},
             ),
             SimpleNamespace(
-                id="keep-dec",
+                id=keep_dec_id,
                 payload={"metadata": {
                     "source": "keep.pdf", "is_catalogue_card": True,
                     "chat_id": "chat",
                 }},
             ),
             SimpleNamespace(
-                id="del-chunk",
-                payload={"metadata": {"source": "del.pdf", "chunk_index": 0}},
+                id=del_chunk_id,
+                payload={"metadata": {
+                    "source": "del.pdf", "chunk_index": 0,
+                    "is_catalogue_card": True, "full_card": "a stale card body",
+                }},
             ),
         ],
         EPS: [
             SimpleNamespace(
-                id="del-eps",
+                id=del_eps_id,
                 payload={"metadata": {
                     "source": "del.pdf", "is_catalogue_card": True,
                     "chat_id": "chat",
                 }},
             ),
             SimpleNamespace(
-                id="keep-eps",
+                id=keep_eps_id,
                 payload={"metadata": {
                     "source": "keep.pdf", "is_catalogue_card": True,
                     "chat_id": "chat",
@@ -1142,13 +1150,13 @@ if __name__ == "__main__":
     asyncio.run(phase_b.delete("del.pdf", cat_b))
     remaining_dec = [r.id for r in handler_b.by_collection.get(DEC, [])]
     remaining_eps = [r.id for r in handler_b.by_collection.get(EPS, [])]
-    assert "del-dec" not in remaining_dec and "del-eps" not in remaining_eps, (
+    assert del_dec_id not in remaining_dec and del_eps_id not in remaining_eps, (
         "(abc-b) delete must remove the source's cards in both collections"
     )
-    assert "del-chunk" in remaining_dec, (
-        "(abc-b) delete must not remove the source's non-card chunks"
+    assert del_chunk_id in remaining_dec, (
+        "(abc-b) delete must not remove a chunk that merely carries the card flags"
     )
-    assert "keep-dec" in remaining_dec and "keep-eps" in remaining_eps, (
+    assert keep_dec_id in remaining_dec and keep_eps_id in remaining_eps, (
         "(abc-b) delete must not touch another source's cards"
     )
     deletes_after_first = len(handler_b.deleted)
@@ -1229,7 +1237,7 @@ if __name__ == "__main__":
     )
 
     groups_v = asyncio.run(
-        cat_alog._load_source_chunk_groups(handler_v, "graph.pdf")
+        cat_alog._load_source_chunk_groups(handler_v, "graph.pdf", cat_v.agent_key)
     )
     assert [(g[0], g[1], len(g[2])) for g in groups_v] == [(DEC, None, 1)], (
         "(v) a GraphRAG chunk flagged with stale card metadata must still form a group"
@@ -1247,7 +1255,7 @@ if __name__ == "__main__":
     clean_meta = dict(clean_chunk.payload["metadata"])
     handler_clean = FakePhaseHandler({DEC: [clean_chunk], EPS: []})
     groups_clean = asyncio.run(
-        cat_alog._load_source_chunk_groups(handler_clean, "clean.pdf")
+        cat_alog._load_source_chunk_groups(handler_clean, "clean.pdf", "agent")
     )
     assert [(g[0], g[1], len(g[2])) for g in groups_clean] == [(DEC, None, 1)], (
         "(v1) a plain chunk must form exactly one group"
@@ -1262,17 +1270,20 @@ if __name__ == "__main__":
         "# CATALOGUE CARD\n\n## Source file or URL: card.pdf\n\n"
         "## Initial page\n\nabstract\n\n## Summary\n\nold card summary\n"
     )
-    genuine_card = SimpleNamespace(id="genuine-card", payload={
-        "page_content": "## Summary\n\nold card summary",
-        "metadata": {
-            "source": "card.pdf",
-            "is_catalogue_card": True,
-            "full_card": genuine_full,
+    genuine_card = SimpleNamespace(
+        id=cat_alog._catalogue_card_point_id("agent", None, "card.pdf"),
+        payload={
+            "page_content": "## Summary\n\nold card summary",
+            "metadata": {
+                "source": "card.pdf",
+                "is_catalogue_card": True,
+                "full_card": genuine_full,
+            },
         },
-    })
+    )
     handler_card = FakePhaseHandler({DEC: [genuine_card], EPS: []})
     groups_card = asyncio.run(
-        cat_alog._load_source_chunk_groups(handler_card, "card.pdf")
+        cat_alog._load_source_chunk_groups(handler_card, "card.pdf", "agent")
     )
     assert groups_card == [], "(v2) a genuine catalogue card must be excluded"
     assert genuine_card.payload["metadata"]["is_catalogue_card"] is True, (
@@ -1323,6 +1334,127 @@ if __name__ == "__main__":
     )
     assert "graphrag-chunk" in surviving_ids_v and points_v[0].id in surviving_ids_v, (
         "(v3) the store must hold the chunk AND the card as distinct points"
+    )
+
+    # (w-a) LIVE REGRESSION: a single-chunk source whose chunk carries
+    # card flags + full_card but whose id is NOT the deterministic card id.
+    # Identity, not content, decides: it must be returned as a source chunk.
+    full_card_w = (
+        "# CATALOGUE CARD\n\n## Source file or URL: test_oop_verify.txt\n\n"
+        "## Initial page\n\ntext\n\n## Summary\n\nsummary\n"
+    )
+    chunk_w = SimpleNamespace(id="chunk-not-card", payload={
+        "page_content": full_card_w,
+        "metadata": {
+            "source": "test_oop_verify.txt",
+            "chunk_index": 0,
+            "is_catalogue_card": True,
+            "is_catalogue_card_segment": True,
+            "full_card": full_card_w,
+        },
+    })
+    handler_w = FakePhaseHandler({DEC: [chunk_w], EPS: []})
+    groups_w = asyncio.run(cat_alog._load_source_chunk_groups(
+        handler_w, "test_oop_verify.txt", "agent",
+    ))
+    assert [(g[0], g[1], len(g[2])) for g in groups_w] == [(DEC, None, 1)], (
+        "(w-a) a chunk carrying card flags at a non-card id must remain a chunk"
+    )
+    assert "is_catalogue_card" not in chunk_w.payload["metadata"], (
+        "(w-a) the card-only keys must be stripped from the chunk"
+    )
+
+    # (w-b) A record whose id IS the deterministic card id is a card and is
+    # excluded from the source chunks.
+    card_id_wb = cat_alog._catalogue_card_point_id(
+        "agent", None, "identity.pdf",
+    )
+    card_wb = SimpleNamespace(id=card_id_wb, payload={
+        "page_content": "## Summary\n\nanything at all",
+        "metadata": {
+            "source": "identity.pdf",
+            "chunk_index": 0,
+            "is_catalogue_card": True,
+        },
+    })
+    handler_wb = FakePhaseHandler({DEC: [card_wb], EPS: []})
+    groups_wb = asyncio.run(cat_alog._load_source_chunk_groups(
+        handler_wb, "identity.pdf", "agent",
+    ))
+    assert groups_wb == [], "(w-b) a point at the card id must be excluded"
+
+    # (w-c) A segmented card: every segment id derives from the same source
+    # with its own :s<start_index> suffix and must be excluded.
+    seg_records = [
+        SimpleNamespace(
+            id=cat_alog._catalogue_card_point_id(
+                "agent", None, "seg.pdf", index, start_index=offset,
+            ),
+            payload={
+                "page_content": f"segment {offset}",
+                "metadata": {
+                    "source": "seg.pdf",
+                    "chunk_index": 0,
+                    "is_catalogue_card": True,
+                    "is_catalogue_card_segment": True,
+                    "start_index": offset,
+                },
+            },
+        )
+        for index, offset in enumerate((0, 1200, 2600))
+    ]
+    handler_wc = FakePhaseHandler({DEC: seg_records, EPS: []})
+    groups_wc = asyncio.run(cat_alog._load_source_chunk_groups(
+        handler_wc, "seg.pdf", "agent",
+    ))
+    assert groups_wc == [], "(w-c) every segment of a card must be excluded"
+
+    # (w-d) The purge paths delete ONLY records at a card id, never a chunk
+    # that merely carries the flags.
+    base_purge_id = cat_alog._catalogue_card_point_id("agent", "chat", "purge.pdf")
+    seg_purge_id = cat_alog._catalogue_card_point_id(
+        "agent", "chat", "purge.pdf", 1, start_index=900,
+    )
+    flagged_chunk_id = "flagged-chunk-not-card"
+    purge_records = [
+        SimpleNamespace(id=base_purge_id, payload={"metadata": {
+            "source": "purge.pdf", "chat_id": "chat", "is_catalogue_card": True,
+        }}),
+        SimpleNamespace(id=seg_purge_id, payload={"metadata": {
+            "source": "purge.pdf", "chat_id": "chat", "chunk_index": 0,
+            "start_index": 900, "is_catalogue_card": True,
+            "is_catalogue_card_segment": True,
+        }}),
+        SimpleNamespace(id=flagged_chunk_id, payload={
+            "page_content": "real source body",
+            "metadata": {
+                "source": "purge.pdf", "chat_id": "chat", "chunk_index": 0,
+                "is_catalogue_card": True, "full_card": "stale card",
+            },
+        }),
+    ]
+    handler_wd = FakePhaseHandler({DEC: list(purge_records), EPS: []})
+    cat_wd = FakeCat(FakeFileManager([]), handler_wd, {})
+    removed_wd = asyncio.run(
+        cat_alog._delete_source_catalogue_cards(cat_wd, "purge.pdf")
+    )
+    remaining_wd = {r.id for r in handler_wd.by_collection[DEC]}
+    assert removed_wd == 2, "(w-d) delete must remove exactly the two card points"
+    assert base_purge_id not in remaining_wd and seg_purge_id not in remaining_wd, (
+        "(w-d) delete must remove every real card segment"
+    )
+    assert flagged_chunk_id in remaining_wd, (
+        "(w-d) delete must never remove a chunk that merely carries the flags"
+    )
+
+    handler_wd2 = FakePhaseHandler({DEC: list(purge_records), EPS: []})
+    purged_wd2 = asyncio.run(cat_alog._purge_existing_cards(
+        handler_wd2, DEC, "purge.pdf", "chat", "test", "agent",
+    ))
+    remaining_wd2 = {r.id for r in handler_wd2.by_collection[DEC]}
+    assert purged_wd2 == 2, "(w-d) replace must purge exactly the two card points"
+    assert flagged_chunk_id in remaining_wd2, (
+        "(w-d) replace must never purge a chunk that merely carries the flags"
     )
 
     print("test_catalog_phase: ALL ASSERTIONS PASSED")

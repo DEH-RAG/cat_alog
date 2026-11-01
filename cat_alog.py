@@ -350,23 +350,48 @@ _CARD_METADATA_KEYS = (
 )
 
 
-def _is_catalogue_card_record(meta: Dict, content: str) -> bool:
-    """Whether a stored record IS a catalogue card (not a chunk flagged by stale metadata).
+def _record_point_id(record) -> "Optional[str]":
+    """The stored point id of a record (point level, payload fallback)."""
+    point_id = getattr(record, "id", None) or (record.payload or {}).get("id")
+    return str(point_id) if point_id is not None else None
 
-    The ``is_catalogue_card`` flag alone is not authoritative: a source chunk
-    can carry it when stale card metadata was merged onto the chunk document.
-    A real card/segment is, by construction, a slice of its own ``full_card``;
-    a genuine source chunk is not. When the flag is set but the content is not
-    part of ``full_card``, the record is a source chunk and MUST be summarized.
-    Legacy cards without ``full_card`` keep the flag semantics.
+
+def _catalogue_card_id_from_metadata(meta: Dict, agent_key: str) -> "Optional[str]":
+    """The deterministic card id a record's OWN metadata describes.
+
+    Mirrors the write path exactly: ``chat_id`` scopes the card, a segment's
+    ``start_index`` selects its ``:s<start_index>`` suffix, and a plain card
+    falls back to its ``chunk_index`` (always 0 for the first-chunk-derived
+    card). Returns ``None`` when the record cannot describe a card at all.
     """
-    if not meta.get("is_catalogue_card"):
+    source = meta.get("source")
+    if not source:
+        return None
+    index = meta.get("chunk_index")
+    if isinstance(index, bool) or not isinstance(index, int):
+        index = 0
+    start_index = meta.get("start_index")
+    if isinstance(start_index, bool) or not isinstance(start_index, int):
+        start_index = None
+    return _catalogue_card_point_id(
+        agent_key, meta.get("chat_id"), str(source), index, start_index=start_index,
+    )
+
+
+def _is_catalogue_card_record(meta: Dict, point_id: "Optional[str]", agent_key: str) -> bool:
+    """Whether a stored record IS a catalogue card, by IDENTITY (not content).
+
+    The ``is_catalogue_card`` flag alone is not authoritative: an actual source
+    chunk can carry it when stale card metadata was merged onto the chunk
+    document. The ONLY authoritative test is the point id: a card (or one of
+    its segments) is written at the id :func:`_catalogue_card_point_id` derives
+    from its own ``source``/``chat_id``/``chunk_index``/``start_index``. Anything
+    else that merely carries the flag is a source chunk, never a card.
+    """
+    if not meta.get("is_catalogue_card") or point_id is None:
         return False
-    full_card = meta.get("full_card")
-    text = (content or "").strip()
-    if not isinstance(full_card, str) or not full_card.strip() or not text:
-        return True
-    return " ".join(text.split()) in " ".join(full_card.split())
+    expected = _catalogue_card_id_from_metadata(meta, agent_key)
+    return expected is not None and str(point_id) == expected
 
 
 def _strip_card_metadata(meta: Dict) -> Dict:
@@ -392,7 +417,7 @@ def _point_order(record) -> Tuple[int, int]:
     return 1, 0
 
 
-async def _load_source_chunk_groups(handler, source: str):
+async def _load_source_chunk_groups(handler, source: str, agent_key: str):
     """Stored chunks for ``source`` grouped by (collection, chat_id).
 
     Chunks live in DECLARATIVE for agent-scoped sources and in EPISODIC for
@@ -402,11 +427,11 @@ async def _load_source_chunk_groups(handler, source: str):
     its own card, and one chat's text never leaks into another chat's card.
 
     Within a collection, chunks without a ``chat_id`` form the agent-scoped
-    group. Genuine catalogue cards are excluded so a re-run never summarizes its
-    own card (see :func:`_is_catalogue_card_record`: the flag alone is not
-    authoritative when a real chunk carries stale card metadata), and derived
-    image points are excluded because they are not source text. Returns a list
-    of ``(collection, chat_id, points)`` sorted by ``start_index`` then
+    group. Catalogue cards are excluded by IDENTITY (see
+    :func:`_is_catalogue_card_record`: only a point at the deterministic card
+    id is a card, the flag alone is not authoritative), and derived image
+    points are excluded because they are not source text. Returns a list of
+    ``(collection, chat_id, points)`` sorted by ``start_index`` then
     ``chunk_index``.
     """
     groups = []
@@ -420,7 +445,7 @@ async def _load_source_chunk_groups(handler, source: str):
             content = (record.payload or {}).get("page_content") or ""
             if meta.get("image") is True:
                 continue
-            if _is_catalogue_card_record(meta, content):
+            if _is_catalogue_card_record(meta, _record_point_id(record), agent_key):
                 continue
             if not content.strip():
                 continue
@@ -475,7 +500,7 @@ def _segment_card(card: str, card_metadata: Dict, embedder) -> list:
     return segments
 
 
-async def _purge_existing_cards(handler, collection, source: str, chat_id, log_prefix: str) -> int:
+async def _purge_existing_cards(handler, collection, source: str, chat_id, log_prefix: str, agent_key: str) -> int:
     """Delete every stored card point of ``source`` in ``collection`` for ``chat_id``.
 
     A re-run of the ``catalog_cards`` phase can produce a DIFFERENT number of
@@ -499,11 +524,11 @@ async def _purge_existing_cards(handler, collection, source: str, chat_id, log_p
     for record in records or []:
         payload = record.payload or {}
         meta = payload.get("metadata", {}) or {}
-        if not _is_catalogue_card_record(meta, payload.get("page_content") or ""):
+        if not _is_catalogue_card_record(meta, _record_point_id(record), agent_key):
             continue
         if meta.get("chat_id") != chat_id:
             continue
-        point_id = getattr(record, "id", None) or (record.payload or {}).get("id")
+        point_id = _record_point_id(record)
         if point_id is not None:
             stale_ids.append(point_id)
     if stale_ids:
@@ -687,9 +712,9 @@ async def _delete_source_catalogue_cards(cat, source: str) -> int:
         for record in records or []:
             payload = record.payload or {}
             meta = payload.get("metadata", {}) or {}
-            if not _is_catalogue_card_record(meta, payload.get("page_content") or ""):
+            if not _is_catalogue_card_record(meta, _record_point_id(record), cat.agent_key):
                 continue
-            point_id = getattr(record, "id", None) or payload.get("id")
+            point_id = _record_point_id(record)
             if point_id is not None:
                 stale_ids.append(point_id)
         if stale_ids:
@@ -728,7 +753,7 @@ async def _run_catalog_cards_phase(source, cat) -> Dict[str, Any]:
     # SAME source name can exist in several chats. Grouping by (collection,
     # chat_id) keeps each conversation's text isolated: every group becomes its
     # own card, in the SAME collection, with its own chat_id.
-    groups = await _load_source_chunk_groups(handler, source)
+    groups = await _load_source_chunk_groups(handler, source, cat.agent_key)
     if not groups:
         return {"status": "not_ready", "retry_after": 5}
 
@@ -813,7 +838,7 @@ async def _run_catalog_cards_phase(source, cat) -> Dict[str, Any]:
         # first: the write is then idempotent and one source never ends up with
         # two cards.
         await _purge_existing_cards(
-            handler, collection, source, chat_id, "cat_alog"
+            handler, collection, source, chat_id, "cat_alog", cat.agent_key
         )
         await handler.add_points_to_tenant(collection, points=card_points)
 
