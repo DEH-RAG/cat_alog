@@ -104,6 +104,19 @@ Maximum {max_summary_words} words.
 
 _EFFICIENT_INGESTION_CONFIG_NAME = "EfficientIngestionConfiguration"
 
+# EffING is optional: the classic CAT ingestion path must keep working when its
+# phase module is absent. The class API is imported from the CANONICAL path
+# (the host loads ``cat/core_plugins/`` and derives the module name from the
+# folder, so any other path would be a second module identity).
+try:
+    from cat.core_plugins.cat_efficient_ingestion.phases import (
+        IngestionPhase as _IngestionPhase,
+        PhaseResult as _PhaseResult,
+    )
+except Exception:  # noqa: BLE001 - optional dependency, never break the import
+    _IngestionPhase = None
+    _PhaseResult = None
+
 
 async def _resolved_system_ingestion_config_name(cat) -> "Optional[str]":
     """Effective SYSTEM-level ingestion engine name.
@@ -498,6 +511,16 @@ async def ingestion_phase_settings_marker(phase, cat) -> Any:
     """
     if phase != "catalog_cards":
         return None
+    return await _catalogue_settings_marker(cat)
+
+
+async def _catalogue_settings_marker(cat) -> str:
+    """Configuration-only material fingerprint for the catalogue cards phase.
+
+    Undecorated so both the hook and :class:`CatalogCardsPhase` can call it
+    (the ``@hook`` decorator replaces the module-level name with a ``CatHook``
+    object, which is not directly callable). No LLM call.
+    """
     settings = await cat.plugin_manager.get_plugin().load_settings()
     settings = settings or {}
     config = (
@@ -568,19 +591,14 @@ async def ingestion_phase_run(phase, source, completed_phases, cat) -> Any:
         return _phase_failure_status(exc)
 
 
-@hook(priority=10)
-async def ingestion_phase_purge(phase, source, cat) -> Any:
-    """Purge the catalogue-card points of ``source`` (phase purge hook).
+async def _delete_source_catalogue_cards(cat, source: str) -> int:
+    """Delete ONLY ``source``'s catalogue-card points, across both collections.
 
-    EffING calls this before re-running an abandoned (expired-lease)
-    ``catalog_cards`` phase. Deletes ONLY this source's catalogue-card points
-    across ALL segments and BOTH collections (declarative + episodic), scoped
-    by ``is_catalogue_card`` so the source's chunks, images, graph artifacts
-    and every other source are untouched. Returns a truthy status dict after
-    purging, and ``None`` for phases this plugin does not implement.
+    Scoped by ``source`` + ``is_catalogue_card`` so the source's chunks, images,
+    graph artefacts and every other source are untouched (the tenant is
+    enforced by the handler). Idempotent and safe when nothing exists: with no
+    matching points no delete is issued and ``0`` is returned.
     """
-    if phase != "catalog_cards":
-        return None
     handler = cat.vector_memory_handler
     removed = 0
     for collection in (
@@ -603,6 +621,23 @@ async def ingestion_phase_purge(phase, source, cat) -> Any:
         if stale_ids:
             await handler.delete_tenant_points_by_ids(collection, stale_ids)
             removed += len(stale_ids)
+    return removed
+
+
+@hook(priority=10)
+async def ingestion_phase_purge(phase, source, cat) -> Any:
+    """Purge the catalogue-card points of ``source`` (phase purge hook).
+
+    EffING calls this before re-running an abandoned (expired-lease)
+    ``catalog_cards`` phase. Deletes ONLY this source's catalogue-card points
+    across ALL segments and BOTH collections (declarative + episodic), scoped
+    by ``is_catalogue_card`` so the source's chunks, images, graph artifacts
+    and every other source are untouched. Returns a truthy status dict after
+    purging, and ``None`` for phases this plugin does not implement.
+    """
+    if phase != "catalog_cards":
+        return None
+    removed = await _delete_source_catalogue_cards(cat, source)
     log.info(f"cat_alog: purged {removed} catalogue-card segment(s) for '{source}'")
     return {"status": "done", "purged": removed}
 
@@ -713,6 +748,119 @@ async def _run_catalog_cards_phase(source, cat) -> Dict[str, Any]:
             f"in {collection} (chat={chat_id}, {len(card_points)} segment(s))"
         )
     return {"status": "done"}
+
+
+def _phase_result_from_status(phase_id: str, result: Any):
+    """Map the legacy status dict to EffING's ``PhaseResult`` (never silent)."""
+    if _PhaseResult is not None and isinstance(result, _PhaseResult):
+        return result
+    if isinstance(result, dict):
+        status = result.get("status")
+        if status not in ("done", "not_ready", "error", "skipped"):
+            return _PhaseResult(
+                status="error",
+                reason=f"phase '{phase_id}' returned invalid status {status!r}",
+            )
+        return _PhaseResult(status=status, reason=result.get("reason"))
+    if result is None:
+        return _PhaseResult(
+            status="error", reason=f"phase '{phase_id}' has no run implementation"
+        )
+    return _PhaseResult(
+        status="error",
+        reason=f"phase '{phase_id}' returned {result!r} (expected a status dict)",
+    )
+
+
+if _IngestionPhase is not None:
+
+    class CatalogCardsPhase(_IngestionPhase):
+        """The ``catalog_cards`` ingestion phase as an EffING phase object.
+
+        Owns the applicability gate, the phase body (delegated to the SAME
+        card-generation path the legacy hook uses) and a source-scoped
+        ``delete``. Registered through ``ingestion_phase_objects``; the legacy
+        hooks stay in place for one release, but EffING now sees this class.
+        """
+
+        id = "catalog_cards"
+        depends_on = ("parsing_chunking", "embedding")
+        settings_category = None
+
+        def __init__(self, cat=None):
+            # Carries the cat that contributed this instance so ``tag`` (whose
+            # ABC signature receives only ``settings``) can read the config
+            # marker. Instances are created fresh by the registry on every
+            # probe, so this is not shared mutable state.
+            self._cat = cat
+
+        async def applies_to(self, cat, deps_state) -> Tuple[bool, Optional[str]]:
+            """Apply only on the EffING phase path (classic hooks otherwise).
+
+            ``_phase_machine_active`` is the single source of truth for which
+            implementation owns card generation. When it is false the classic
+            ``before_rabbithole_*`` hooks produce the cards, so the phase is
+            reported ``skipped`` (with a reason) instead of staying ``pending``.
+            """
+            used = cat if cat is not None else self._cat
+            if used is None:
+                return False, "no catcher instance to evaluate the catalogue phase"
+            if await _phase_machine_active(used):
+                return True, None
+            return (
+                False,
+                "catalogue cards are handled by the classic hooks "
+                "(EffING phase path not active for this agent)",
+            )
+
+        async def process(self, source: str, cat):
+            """Delegate to the EXISTING card-generation path (no reimplementation)."""
+            used = cat if cat is not None else self._cat
+            try:
+                result = await _run_catalog_cards_phase(source, used)
+            except Exception as exc:  # noqa: BLE001 - failure is a status, never a raise
+                log.error(
+                    f"cat_alog: phase catalog_cards failed for '{source}': "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                failure = _phase_failure_status(exc)
+                return _phase_result_from_status(self.id, failure)
+            return _phase_result_from_status(self.id, result)
+
+        async def delete(self, source: str, cat) -> None:
+            """Remove ONLY ``source``'s card points; idempotent and empty-safe."""
+            used = cat if cat is not None else self._cat
+            removed = await _delete_source_catalogue_cards(used, source)
+            log.info(
+                f"cat_alog: phase catalog_cards deleted {removed} "
+                f"catalogue-card segment(s) for '{source}'"
+            )
+
+        async def tag(self, settings: Any = None) -> str:
+            """Configuration-only invalidator: reuse the existing settings marker.
+
+            No LLM call. When the registry already resolved the marker it is
+            handed in as ``settings``; a direct call reads it from the cat.
+            """
+            if settings is None and self._cat is not None:
+                settings = await _catalogue_settings_marker(self._cat)
+            return await super().tag(settings)
+
+
+else:
+    CatalogCardsPhase = None
+
+
+@hook(priority=10)
+def ingestion_phase_objects(cat=None, lizard=None) -> list:
+    """Contribute the ``CatalogCardsPhase`` instance to EffING's registry.
+
+    Import-safe: with EffING absent the class could not be defined and this
+    returns an empty list, leaving the legacy hooks as the only path.
+    """
+    if CatalogCardsPhase is None:
+        return []
+    return [CatalogCardsPhase(cat if cat is not None else lizard)]
 
 
 @hook(priority=10)

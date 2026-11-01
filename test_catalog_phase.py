@@ -141,6 +141,67 @@ if __name__ == "__main__":
     cat_db_settings.get_settings_by_category = _fake_get_settings_by_category
     cat_db_cruds.settings = cat_db_settings
 
+    # ── Stub EffING's canonical phase module for the class definition ──────
+    # `cat_alog` imports `IngestionPhase`/`PhaseResult` from the canonical path
+    # at module load (guarded). The stub proves the ABC subclass is built and
+    # exercisable without the real plugin; it is removed right after the
+    # import so the classic-path gate behaves exactly as in production.
+    import abc as _abc
+    import hashlib as _hashlib
+    import json as _json
+
+    cat_core = types.ModuleType("cat.core_plugins")
+    cat_core.__path__ = []
+    cat_core_effing = types.ModuleType("cat.core_plugins.cat_efficient_ingestion")
+    cat_core_effing.__path__ = []
+    stub_phases = types.ModuleType(
+        "cat.core_plugins.cat_efficient_ingestion.phases"
+    )
+
+    class _StubIngestionPhase(_abc.ABC):
+        id = ""
+        depends_on = ()
+        settings_category = None
+        settings_check = None
+
+        @property
+        def name(self):
+            return self.id
+
+        @_abc.abstractmethod
+        async def applies_to(self, cat, deps_state):
+            raise NotImplementedError
+
+        @_abc.abstractmethod
+        async def process(self, source, cat):
+            raise NotImplementedError
+
+        @_abc.abstractmethod
+        async def delete(self, source, cat):
+            raise NotImplementedError
+
+        async def tag(self, settings=None):
+            payload = _json.dumps(
+                settings, sort_keys=True, separators=(",", ":"), default=str
+            )
+            return _hashlib.sha256(f"{self.id}:{payload}".encode()).hexdigest()
+
+    class _StubPhaseResult:
+        def __init__(self, status, reason=None, processed=None, expected=None):
+            self.status = status
+            self.reason = reason
+            self.processed = processed
+            self.expected = expected
+
+    stub_phases.IngestionPhase = _StubIngestionPhase
+    stub_phases.PhaseResult = _StubPhaseResult
+    cat_core.cat_efficient_ingestion = cat_core_effing
+    cat_core_effing.phases = stub_phases
+
+    sys.modules["cat.core_plugins"] = cat_core
+    sys.modules["cat.core_plugins.cat_efficient_ingestion"] = cat_core_effing
+    sys.modules["cat.core_plugins.cat_efficient_ingestion.phases"] = stub_phases
+
     sys.modules["pydantic"] = pydantic_mod
     sys.modules["langchain_core"] = types.ModuleType("langchain_core")
     sys.modules["langchain_core.documents"] = types.ModuleType("langchain_core.documents")
@@ -160,6 +221,11 @@ if __name__ == "__main__":
 
     sys.path.insert(0, "/root/git/plugins/cat_alog")
     import cat_alog  # noqa: E402
+
+    # The class is defined against the stub ABC; the stub itself is hidden so
+    # `_phase_machine_active` keeps taking the classic path until test (q).
+    sys.modules.pop("cat.core_plugins.cat_efficient_ingestion.phases", None)
+    del cat_core_effing.phases
 
     # ── Fake cat surface ──────────────────────────────────────────────────
     CARD_TEXT = (
@@ -970,5 +1036,147 @@ if __name__ == "__main__":
     assert "NotFoundError" in logged_u[0], "(u) log line must carry the exception class"
     assert len(logged_u) == 1, "(u) phase failure must be logged exactly once"
     assert not handler_u.added, "(u) a failed phase must not write a card"
+
+    # ── Phase ABC migration tests ──────────────────────────────────────────
+    assert cat_alog.CatalogCardsPhase is not None, (
+        "CatalogCardsPhase must be defined when EffING's ABC is importable"
+    )
+    assert issubclass(cat_alog.CatalogCardsPhase, cat_alog._IngestionPhase), (
+        "CatalogCardsPhase must subclass the canonical IngestionPhase"
+    )
+
+    # (abc-a) Catalogue-disabled agent -> applies_to False -> skipped.
+    catalogue_off = build_cat(with_file=True)
+    phase_a = cat_alog.CatalogCardsPhase(catalogue_off)
+    original_gate_a = cat_alog._phase_machine_active
+
+    async def _gate_off(cat=None):
+        return False
+
+    async def _gate_on(cat=None):
+        return True
+
+    cat_alog._phase_machine_active = _gate_off
+    try:
+        applies_off, reason_off = asyncio.run(
+            phase_a.applies_to(catalogue_off, {})
+        )
+    finally:
+        cat_alog._phase_machine_active = original_gate_a
+    assert applies_off is False, "(abc-a) a disabled catalogue must not apply"
+    assert reason_off, "(abc-a) skipped phase must carry a reason"
+    cat_alog._phase_machine_active = _gate_on
+    try:
+        applies_on, reason_on = asyncio.run(phase_a.applies_to(catalogue_off, {}))
+    finally:
+        cat_alog._phase_machine_active = original_gate_a
+    assert applies_on is True and reason_on is None, (
+        "(abc-a) an enabled catalogue must apply without a reason"
+    )
+    registered = cat_alog.ingestion_phase_objects(cat=catalogue_off)
+    assert len(registered) == 1 and isinstance(
+        registered[0], cat_alog.CatalogCardsPhase
+    ), "(abc-a) the phase must be registered through ingestion_phase_objects"
+
+    # (abc-b) delete() removes ONLY the source's cards and is idempotent.
+    handler_b = FakePhaseHandler({
+        DEC: [
+            SimpleNamespace(
+                id="del-dec",
+                payload={"metadata": {
+                    "source": "del.pdf", "is_catalogue_card": True,
+                    "chat_id": "chat",
+                }},
+            ),
+            SimpleNamespace(
+                id="keep-dec",
+                payload={"metadata": {
+                    "source": "keep.pdf", "is_catalogue_card": True,
+                    "chat_id": "chat",
+                }},
+            ),
+            SimpleNamespace(
+                id="del-chunk",
+                payload={"metadata": {"source": "del.pdf", "chunk_index": 0}},
+            ),
+        ],
+        EPS: [
+            SimpleNamespace(
+                id="del-eps",
+                payload={"metadata": {
+                    "source": "del.pdf", "is_catalogue_card": True,
+                    "chat_id": "chat",
+                }},
+            ),
+            SimpleNamespace(
+                id="keep-eps",
+                payload={"metadata": {
+                    "source": "keep.pdf", "is_catalogue_card": True,
+                    "chat_id": "chat",
+                }},
+            ),
+        ],
+    })
+    cat_b = FakeCat(FakeFileManager([]), handler_b, {})
+    phase_b = cat_alog.CatalogCardsPhase(cat_b)
+    asyncio.run(phase_b.delete("del.pdf", cat_b))
+    remaining_dec = [r.id for r in handler_b.by_collection.get(DEC, [])]
+    remaining_eps = [r.id for r in handler_b.by_collection.get(EPS, [])]
+    assert "del-dec" not in remaining_dec and "del-eps" not in remaining_eps, (
+        "(abc-b) delete must remove the source's cards in both collections"
+    )
+    assert "del-chunk" in remaining_dec, (
+        "(abc-b) delete must not remove the source's non-card chunks"
+    )
+    assert "keep-dec" in remaining_dec and "keep-eps" in remaining_eps, (
+        "(abc-b) delete must not touch another source's cards"
+    )
+    deletes_after_first = len(handler_b.deleted)
+    asyncio.run(phase_b.delete("del.pdf", cat_b))
+    assert len(handler_b.deleted) == deletes_after_first, (
+        "(abc-b) a second delete must be a no-op (idempotent)"
+    )
+    asyncio.run(phase_b.delete("never-existed.pdf", cat_b))
+    assert len(handler_b.deleted) == deletes_after_first, (
+        "(abc-b) delete of an absent source must be safe and write nothing"
+    )
+
+    # (abc-c) tag() is stable, changes with the config, ignores cache tuning.
+    LLM_SETTINGS["agent"] = {"name": "LLMConfig", "value": {"model": "gpt-x"}}
+    tag_base = build_cat(settings={"max_summary_words": 200})
+    tag_phase = cat_alog.CatalogCardsPhase(tag_base)
+    t1 = asyncio.run(tag_phase.tag())
+    t2 = asyncio.run(tag_phase.tag())
+    assert t1 == t2, "(abc-c) an unchanged configuration must keep the same tag"
+    tag_cache = cat_alog.CatalogCardsPhase(
+        build_cat(settings={"max_summary_words": 200, "cache_ttl_seconds": 1})
+    )
+    assert asyncio.run(tag_cache.tag()) == t1, (
+        "(abc-c) cache tuning must not change the tag"
+    )
+    tag_words = cat_alog.CatalogCardsPhase(
+        build_cat(settings={"max_summary_words": 201})
+    )
+    assert asyncio.run(tag_words.tag()) != t1, (
+        "(abc-c) a catalogue config change must change the tag"
+    )
+
+    # (abc-d) process() delegates to the existing card-generation path.
+    delegate_calls = []
+
+    async def _fake_cards_path(source, cat):
+        delegate_calls.append((source, cat))
+        return {"status": "done"}
+
+    original_cards_path = cat_alog._run_catalog_cards_phase
+    cat_alog._run_catalog_cards_phase = _fake_cards_path
+    try:
+        result_d = asyncio.run(phase_b.process("delegate.pdf", cat_b))
+    finally:
+        cat_alog._run_catalog_cards_phase = original_cards_path
+    assert delegate_calls == [("delegate.pdf", cat_b)], (
+        "(abc-d) process must delegate to _run_catalog_cards_phase"
+    )
+    assert result_d.status == "done", "(abc-d) a done status must map to done"
 
     print("test_catalog_phase: ALL ASSERTIONS PASSED")
