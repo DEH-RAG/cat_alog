@@ -1238,6 +1238,47 @@ if __name__ == "__main__":
         "(v) stale card keys must be stripped from the chunk before building the card"
     )
 
+    # (v1) A plain chunk (chunk fields only) must yield exactly one group and
+    # must be left untouched by the loader.
+    clean_chunk = SimpleNamespace(id="clean-chunk", payload={
+        "page_content": "CLEAN SOURCE TEXT " * 5,
+        "metadata": {"source": "clean.pdf", "chunk_index": 0, "has_formula": False},
+    })
+    clean_meta = dict(clean_chunk.payload["metadata"])
+    handler_clean = FakePhaseHandler({DEC: [clean_chunk], EPS: []})
+    groups_clean = asyncio.run(
+        cat_alog._load_source_chunk_groups(handler_clean, "clean.pdf")
+    )
+    assert [(g[0], g[1], len(g[2])) for g in groups_clean] == [(DEC, None, 1)], (
+        "(v1) a plain chunk must form exactly one group"
+    )
+    assert clean_chunk.payload["metadata"] == clean_meta, (
+        "(v1) the loader must not mutate a plain chunk's metadata"
+    )
+
+    # (v2) A GENUINE card (its content is a slice of its own full_card) must be
+    # excluded: the flag is authoritative when the content really is the card.
+    genuine_full = (
+        "# CATALOGUE CARD\n\n## Source file or URL: card.pdf\n\n"
+        "## Initial page\n\nabstract\n\n## Summary\n\nold card summary\n"
+    )
+    genuine_card = SimpleNamespace(id="genuine-card", payload={
+        "page_content": "## Summary\n\nold card summary",
+        "metadata": {
+            "source": "card.pdf",
+            "is_catalogue_card": True,
+            "full_card": genuine_full,
+        },
+    })
+    handler_card = FakePhaseHandler({DEC: [genuine_card], EPS: []})
+    groups_card = asyncio.run(
+        cat_alog._load_source_chunk_groups(handler_card, "card.pdf")
+    )
+    assert groups_card == [], "(v2) a genuine catalogue card must be excluded"
+    assert genuine_card.payload["metadata"]["is_catalogue_card"] is True, (
+        "(v2) excluding a card must not strip the card's own marker"
+    )
+
     async def _short_summary_v(cat, prompt):
         return "SHORT SUMMARY"
 
@@ -1263,5 +1304,25 @@ if __name__ == "__main__":
     assert points_v[0].id == cat_alog._catalogue_card_point_id(
         "agent", None, "graph.pdf"
     ), "(v) the new card must use the deterministic id"
+
+    # (v3) The card write must not mutate the chunk: the chunk keeps its own
+    # fields and gains NO card keys, while the card is a DISTINCT point (its
+    # deterministic id, not the chunk's id).
+    chunk_meta_after = chunk_v.payload["metadata"]
+    assert chunk_meta_after.get("chunk_index") == 0, (
+        "(v3) the card write dropped the chunk's chunk_index"
+    )
+    assert chunk_meta_after.get("source_chunks"), (
+        "(v3) the card write dropped the chunk's source_chunks"
+    )
+    assert not any(key in chunk_meta_after for key in (
+        "is_catalogue_card", "is_catalogue_card_segment", "full_card",
+    )), "(v3) the card write must not add card keys to the chunk"
+    assert points_v[0].id != chunk_v.id, (
+        "(v3) the card must not reuse the chunk's point id"
+    )
+    assert "graphrag-chunk" in surviving_ids_v and points_v[0].id in surviving_ids_v, (
+        "(v3) the store must hold the chunk AND the card as distinct points"
+    )
 
     print("test_catalog_phase: ALL ASSERTIONS PASSED")

@@ -216,7 +216,15 @@ async def _run_summary_agent(cat, prompt: str) -> str:
 
 
 def _build_catalogue_card(source: str, metadata: Dict, abstract: str, summary: str) -> Tuple[str, Dict]:
-    """Build the catalogue card text + metadata (shared by hook and phase)."""
+    """Build the catalogue card text + metadata (shared by hook and phase).
+
+    The seed metadata comes from the first stored chunk. It is stripped of any
+    card-only keys first so the card can never inherit ``is_catalogue_card`` /
+    ``is_catalogue_card_segment`` / ``full_card`` from a chunk that already
+    carries stale card metadata (the chunk keeps its real identity, the card
+    only adds its own marker + ``full_card``). The caller's dict is never
+    mutated: the card metadata is a fresh dict.
+    """
     card = (
         "\n# CATALOGUE CARD\n\n"
         f"## Source file or URL: {source}\n\n"
@@ -227,7 +235,7 @@ def _build_catalogue_card(source: str, metadata: Dict, abstract: str, summary: s
     )
 
     card_metadata = {
-        **metadata,
+        **_strip_card_metadata(metadata),
         "is_catalogue_card": True,
         # Store the FULL card text on every card point. When the card exceeds
         # the embedder's input window it is split into segments by the core
