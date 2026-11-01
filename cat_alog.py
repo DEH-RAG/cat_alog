@@ -752,7 +752,9 @@ async def _run_catalog_cards_phase(source, cat) -> Dict[str, Any]:
 
 def _phase_result_from_status(phase_id: str, result: Any):
     """Map the legacy status dict to EffING's ``PhaseResult`` (never silent)."""
-    if _PhaseResult is not None and isinstance(result, _PhaseResult):
+    if _PhaseResult is None:
+        raise RuntimeError("the EffING phase API is not available")
+    if isinstance(result, _PhaseResult):
         return result
     if isinstance(result, dict):
         status = result.get("status")
@@ -788,6 +790,7 @@ if _IngestionPhase is not None:
         settings_category = None
 
         def __init__(self, cat=None):
+            super().__init__()
             # Carries the cat that contributed this instance so ``tag`` (whose
             # ABC signature receives only ``settings``) can read the config
             # marker. Instances are created fresh by the registry on every
@@ -848,11 +851,13 @@ if _IngestionPhase is not None:
 
 
 else:
-    CatalogCardsPhase = None
+    # Keeps the module surface stable when EffING is absent, without teaching
+    # the type checker a second, incompatible definition of the class.
+    globals()["CatalogCardsPhase"] = None
 
 
 @hook(priority=10)
-def ingestion_phase_objects(cat=None, lizard=None) -> list:
+def ingestion_phase_objects(cat=None, lizard=None) -> List[Any]:
     """Contribute the ``CatalogCardsPhase`` instance to EffING's registry.
 
     Import-safe: with EffING absent the class could not be defined and this
