@@ -1199,4 +1199,69 @@ if __name__ == "__main__":
     )
     assert result_d.status == "done", "(abc-d) a done status must map to done"
 
+    # (v) GraphRAG-shaped payload: a REAL source chunk that carries stale
+    # catalogue-card metadata (is_catalogue_card/full_card/is_catalogue_card_
+    # segment). The loader must NOT treat it as a card: the flag alone is not
+    # authoritative, and dropping it made the phase return not_ready forever.
+    full_card_v = (
+        "# CATALOGUE CARD\n\n## Source file or URL: graph.pdf\n\n"
+        "## Initial page\n\n%PDF-1.3 binary payload\n\n## Summary\n\nold summary\n"
+    )
+    source_text_v = "SOURCE BODY TEXT " * 40
+    chunk_v = SimpleNamespace(id="graphrag-chunk", payload={
+        "page_content": source_text_v,
+        "metadata": {
+            "source": "graph.pdf",
+            "chat_id": None,
+            "chunk_index": 0,
+            "start_index": 39735,
+            "source_chunks": [{"text": "SOURCE BODY", "metadata": {"source": "graph.pdf"}}],
+            "is_catalogue_card": True,
+            "is_catalogue_card_segment": True,
+            "full_card": full_card_v,
+        },
+    })
+    handler_v = FakePhaseHandler({DEC: [chunk_v], EPS: []})
+    cat_v = FakeCat(
+        FakeFileManager([], files={("agent", "graph.pdf"): b"%PDF-1.3 bytes"}),
+        handler_v,
+        {},
+    )
+
+    groups_v = asyncio.run(
+        cat_alog._load_source_chunk_groups(handler_v, "graph.pdf")
+    )
+    assert [(g[0], g[1], len(g[2])) for g in groups_v] == [(DEC, None, 1)], (
+        "(v) a GraphRAG chunk flagged with stale card metadata must still form a group"
+    )
+    assert "is_catalogue_card" not in chunk_v.payload["metadata"], (
+        "(v) stale card keys must be stripped from the chunk before building the card"
+    )
+
+    async def _short_summary_v(cat, prompt):
+        return "SHORT SUMMARY"
+
+    cat_alog._run_summary_agent = _short_summary_v
+    cat_alog._resolve_embedder = _fake_resolve_embedder
+    result_v = asyncio.run(
+        cat_alog.ingestion_phase_run("catalog_cards", "graph.pdf", {}, cat_v)
+    )
+    assert result_v == {"status": "done"}, (
+        "(v) the phase must complete instead of returning not_ready"
+    )
+    surviving_ids_v = [r.id for r in handler_v.by_collection.get(DEC, [])]
+    assert "graphrag-chunk" in surviving_ids_v, (
+        "(v) the real source chunk must not be purged as if it were a card"
+    )
+    _, points_v = handler_v.added[-1]
+    assert points_v[0].payload["metadata"].get("is_catalogue_card") is True, (
+        "(v) the newly generated card must still be marked as a card"
+    )
+    assert points_v[0].payload["metadata"].get("full_card"), (
+        "(v) the newly generated card must still carry full_card"
+    )
+    assert points_v[0].id == cat_alog._catalogue_card_point_id(
+        "agent", None, "graph.pdf"
+    ), "(v) the new card must use the deterministic id"
+
     print("test_catalog_phase: ALL ASSERTIONS PASSED")
