@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import mimetypes
 import os
 import threading
 import time
@@ -289,6 +290,68 @@ def _is_url_source(source: str) -> bool:
     return str(source).startswith(("http://", "https://"))
 
 
+#: Source extensions whose RAW BYTES are readable text, so decoding them gives
+#: a usable card preview. Everything in :data:`_BINARY_SOURCE_EXTENSIONS` is a
+#: container (PDF/Office/images/archives) whose decoded bytes are compressed
+#: garbage — its parsed chunks are the only readable text.
+_TEXTUAL_SOURCE_EXTENSIONS = frozenset({
+    ".md", ".markdown", ".txt", ".text", ".rst", ".rtf",
+    ".html", ".htm", ".xhtml", ".xml", ".json", ".jsonl", ".ndjson",
+    ".csv", ".tsv", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
+    ".log", ".tex", ".bib", ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx",
+    ".css", ".scss", ".sql", ".sh", ".bash",
+})
+
+#: Container formats: never feed their decoded bytes to the LLM. A PDF decoded
+#: as UTF-8 starts with ``%PDF`` and continues with binary streams; Office
+#: documents are ZIP containers; images are binary by definition.
+_BINARY_SOURCE_EXTENSIONS = frozenset({
+    ".pdf", ".pptx", ".ppt", ".docx", ".doc", ".xlsx", ".xls", ".odt", ".ods",
+    ".odp", ".odg", ".epub",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff",
+    ".svg", ".ico", ".heic", ".avif",
+    ".zip", ".gz", ".tgz", ".tar", ".bz2", ".xz", ".7z", ".rar",
+    ".mp3", ".wav", ".ogg", ".flac", ".m4a", ".mp4", ".avi", ".mov", ".mkv",
+    ".webm", ".woff", ".woff2", ".ttf", ".otf", ".eot",
+})
+
+
+def _source_extension(source: str) -> str:
+    """Lower-case extension of a file name or URL (query/fragment stripped)."""
+    path = str(source).split("?", 1)[0].split("#", 1)[0]
+    return os.path.splitext(path)[1].lower()
+
+
+def _is_textual_source(source: str) -> bool:
+    """Whether decoding ``source``'s raw bytes yields readable text.
+
+    Used to choose the card's "Initial page": textual sources keep the
+    historical raw-bytes preview (their bytes ARE the text), while binary
+    sources (PDF/Office/images/archives) must use the parsed chunks instead —
+    decoding those bytes yields ~80k chars of compressed-stream garbage that
+    the concept/relation LLM correctly refuses to summarize.
+
+    Unknown extensions default to TEXTUAL (raw-bytes preview) so only a known
+    binary container changes behaviour. A URL's extension is the path suffix;
+    with no extension at all, ``mimetypes`` decides, then textual is the
+    conservative fallback.
+    """
+    extension = _source_extension(source)
+    if extension in _TEXTUAL_SOURCE_EXTENSIONS:
+        return True
+    if extension in _BINARY_SOURCE_EXTENSIONS:
+        return False
+    guessed, _ = mimetypes.guess_type(str(source).split("?", 1)[0])
+    if guessed:
+        if guessed.startswith("text/"):
+            return True
+        if guessed in ("application/json", "application/xml", "application/xhtml+xml"):
+            return True
+        # Any other concrete binary type (application/pdf, image/png, ...).
+        return False
+    return True
+
+
 def _decode_source(data: "Optional[bytes]") -> "Optional[str]":
     if data is None:
         return None
@@ -296,6 +359,67 @@ def _decode_source(data: "Optional[bytes]") -> "Optional[str]":
         return data.decode("utf-8", errors="replace")
     except Exception:  # noqa: BLE001 - a preview is best-effort
         return None
+
+
+#: Above this share of U+FFFD the "text" is a binary container decoded as UTF-8
+#: (PDF/Office/archive streams), never prose. Mirrors GraphRAG's extractor.
+_BINARY_REPLACEMENT_RATIO = 0.10
+
+
+def _looks_binary_text(content: str) -> bool:
+    """Whether ``content`` is raw bytes decoded as text rather than prose.
+
+    Such content must never be sent to an LLM (summary or card): a PDF decoded
+    with ``errors="replace"`` starts with ``%PDF`` and/or floods U+FFFD and NUL
+    bytes. Real text can contain the odd replacement char, so only a material
+    share (>= 10%) of the sample marks the content binary.
+    """
+    if not content:
+        return False
+    if "\x00" in content:
+        return True
+    if content.lstrip().startswith("%PDF"):
+        return True
+    sample = content[:4096]
+    if not sample:
+        return False
+    return (sample.count("\ufffd") / len(sample)) >= _BINARY_REPLACEMENT_RATIO
+
+
+def _metadata_is_image(meta: Dict) -> bool:
+    """Whether a point/document describes an IMAGE, not source text.
+
+    Multimodal ingestion stores image points with ``image: True`` (and the
+    saved file name in ``image_file`` / mime in ``image_mime_type``). Their
+    ``page_content`` is only ``"[Image] <source>"``: an image chunk must never
+    reach an LLM prompt.
+    """
+    return bool(
+        meta.get("image") is True
+        or meta.get("image_file")
+        or meta.get("image_mime_type")
+        or meta.get("image_base64")
+    )
+
+
+def _metadata_is_catalogue_card(meta: Dict) -> bool:
+    """Whether a point/document carries any catalogue-card marker/metadata."""
+    return bool(
+        meta.get("is_catalogue_card")
+        or meta.get("is_catalogue_card_segment")
+        or meta.get("full_card")
+    )
+
+
+def _is_llm_text_document(doc) -> bool:
+    """Whether a parsed document is source TEXT safe to send to an LLM."""
+    meta = getattr(doc, "metadata", None) or {}
+    content = getattr(doc, "page_content", "") or ""
+    if not content.strip():
+        return False
+    if _metadata_is_image(meta) or _metadata_is_catalogue_card(meta):
+        return False
+    return not _looks_binary_text(content)
 
 
 async def _read_source_bytes(cat, source: str, chat_id: "Optional[str]") -> "Optional[bytes]":
@@ -394,17 +518,32 @@ def _is_catalogue_card_record(meta: Dict, point_id: "Optional[str]", agent_key: 
     return expected is not None and str(point_id) == expected
 
 
-def _strip_card_metadata(meta: Dict) -> Dict:
-    """Drop card-only keys from a chunk that was wrongly flagged as a card.
+def _strip_card_metadata_in_place(meta: Dict) -> Dict:
+    """Drop card-only keys from a chunk wrongly flagged as a card, in place.
 
-    Also drops the card-derived ``start_index`` (a segment offset into the card
-    text, not a position in the source) so ordering falls back to the chunk's
-    real ``chunk_index``.
+    The stored chunk's metadata dict is the one the handler returned; cleaning
+    it IN PLACE (instead of replacing it with a copy) guarantees every other
+    reference to that dict — the card seed and any consumer still holding the
+    record — observes the cleaned metadata. Also drops the card-derived
+    ``start_index`` (a segment offset into the card text, not a position in the
+    source) so ordering falls back to the chunk's real ``chunk_index``.
     """
-    cleaned = {key: value for key, value in meta.items() if key not in _CARD_METADATA_KEYS}
-    if meta.get("is_catalogue_card_segment"):
-        cleaned.pop("start_index", None)
-    return cleaned
+    was_card_segment = bool(meta.get("is_catalogue_card_segment"))
+    for key in _CARD_METADATA_KEYS:
+        meta.pop(key, None)
+    if was_card_segment:
+        meta.pop("start_index", None)
+    return meta
+
+
+def _strip_card_metadata(meta: Dict) -> Dict:
+    """Return a copy of ``meta`` without the card-only keys (caller untouched).
+
+    Used to seed the card so it can never inherit ``is_catalogue_card`` /
+    ``is_catalogue_card_segment`` / ``full_card`` (and a segment's
+    ``start_index``) from a chunk. The caller's dict is never mutated.
+    """
+    return _strip_card_metadata_in_place(dict(meta))
 
 
 def _point_order(record) -> Tuple[int, int]:
@@ -443,18 +582,23 @@ async def _load_source_chunk_groups(handler, source: str, agent_key: str):
         for record in records or []:
             meta = (record.payload or {}).get("metadata", {}) or {}
             content = (record.payload or {}).get("page_content") or ""
-            if meta.get("image") is True:
+            if _metadata_is_image(meta):
                 continue
             if _is_catalogue_card_record(meta, _record_point_id(record), agent_key):
                 continue
             if not content.strip():
                 continue
+            if _looks_binary_text(content):
+                # A binary container decoded as text (legacy/broken parser):
+                # its bytes must never be summarized or embedded in a card.
+                continue
             if meta.get("is_catalogue_card"):
-                # Stale card metadata on an actual source chunk: strip it so the
-                # new card is built from the chunk's real metadata and the chunk
-                # keeps participating in every later run.
-                meta = _strip_card_metadata(meta)
-                (record.payload or {})["metadata"] = meta
+                # Stale card metadata on an actual source chunk (a legacy
+                # card-write leak): strip it IN PLACE so this record's own
+                # metadata dict — the card seed and any consumer still holding
+                # the record — no longer carries the card flags. The chunk keeps
+                # its real identity and participates in every later run.
+                _strip_card_metadata_in_place(meta)
             by_chat.setdefault(meta.get("chat_id"), []).append(record)
         for chat_id in sorted(by_chat, key=lambda value: (value is not None, str(value))):
             groups.append(
@@ -795,18 +939,30 @@ async def _run_catalog_cards_phase(source, cat) -> Dict[str, Any]:
         if len(full_text) > max_document_chars:
             full_text = full_text[:max_document_chars] + " [truncated] "
 
-        # Initial page: the source's persisted bytes (file on disk / EffING URL
-        # copy) truncated to max_document_chars. When neither is available, fall
-        # back to the stored first chunk (start_index, then chunk_index) and say so.
+        # Initial page. For a TEXTUAL source the raw persisted bytes (file on
+        # disk / EffING URL copy) are themselves readable text: keep the
+        # historical raw-bytes preview, truncated to max_document_chars. For a
+        # BINARY source (PDF/Office/image/archive) decoding those bytes yields
+        # compressed-stream garbage (`%PDF-1.5 …`, replacement chars), so the
+        # initial page MUST be the PARSED text instead: the concatenation of the
+        # source's stored chunks, already fetched above and capped at
+        # max_document_chars by ``full_text``. When a textual source has no
+        # persisted copy, the parsed text is the best-effort fallback.
         abstract = None
-        source_text = _decode_source(await _read_source_bytes(cat, source, chat_id))
-        if source_text is not None and source_text.strip():
-            abstract = source_text[:max_document_chars].strip()
+        if _is_textual_source(source):
+            source_text = _decode_source(await _read_source_bytes(cat, source, chat_id))
+            if source_text is not None and source_text.strip():
+                abstract = source_text[:max_document_chars].strip()
+                log.info(
+                    f"cat_alog: initial page for '{source}' (chat={chat_id}) from "
+                    "the persisted raw bytes (textual source)."
+                )
         if abstract is None:
-            abstract = chunks[0].strip()
-            log.warning(
-                f"cat_alog: no persisted bytes for '{source}' (chat={chat_id}); "
-                "using the stored first chunk as the initial page (best-effort preview)."
+            abstract = full_text.strip()
+            log.info(
+                f"cat_alog: initial page for '{source}' (chat={chat_id}) from the "
+                f"parsed chunks (binary source or no persisted bytes), "
+                f"{len(abstract)} chars."
             )
 
         prompt = _build_summary_prompt(source, full_text, max_summary_words)
@@ -1008,7 +1164,8 @@ async def before_rabbithole_splits_documents(docs: List[Document], cat) -> List[
     if await _phase_machine_active(cat):
         return docs
 
-    metadata = docs[0].metadata
+    text_docs = [doc for doc in docs if _is_llm_text_document(doc)]
+    metadata = (text_docs[0].metadata if text_docs else docs[0].metadata)
     if 'source' not in metadata:
         return docs
 
@@ -1028,9 +1185,16 @@ async def before_rabbithole_splits_documents(docs: List[Document], cat) -> List[
     max_document_chars = int(settings.get("max_document_chars", 8000))
     max_summary_words = int(settings.get("max_summary_words", 200))
 
-    full_text = "\n\n".join(
-        doc.page_content for doc in docs if doc.page_content and doc.page_content.strip()
-    )
+    # ONLY the parsed text chunks are summarized: image chunks (``[Image] …``
+    # placeholders), catalogue-card segments (a previous card's text) and any
+    # binary-looking content must never reach the summary LLM.
+    full_text = "\n\n".join(doc.page_content for doc in text_docs)
+    if not full_text.strip():
+        log.warning(
+            f"cat_alog: no readable text chunks for '{agent_id}/{chat_id}/{source}'; "
+            "skipping the summary (no LLM call)."
+        )
+        return docs
     if len(full_text) > max_document_chars:
         full_text = full_text[:max_document_chars] + ' [truncated] '
 
@@ -1061,7 +1225,8 @@ async def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[
     if await _phase_machine_active(cat):
         return docs
 
-    metadata = docs[0].metadata
+    text_docs = [doc for doc in docs if _is_llm_text_document(doc)]
+    metadata = (text_docs[0].metadata if text_docs else docs[0].metadata)
     if 'source' not in metadata:
         return docs
 
@@ -1075,10 +1240,18 @@ async def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[
     chat_id = metadata.get('chat_id') or getattr(cat, 'id', None)
 
     summary = CATALOGUES.get(agent_id, chat_id, source)
-    abstract = docs[0].page_content.strip()
-
     if not summary:
         log.warning(f"cat_alog: no summary found for {agent_id}/{chat_id}/{source}, skipping catalogue card.")
+        return docs
+
+    # The card's initial page is source TEXT, never an image placeholder, a
+    # previously built card, or decoded binary bytes.
+    abstract = text_docs[0].page_content.strip() if text_docs else ""
+    if not abstract:
+        log.warning(
+            f"cat_alog: no readable text chunks for {agent_id}/{chat_id}/{source}, "
+            "skipping catalogue card."
+        )
         return docs
 
     CATALOGUES.delete(agent_id, chat_id, source)
@@ -1189,6 +1362,12 @@ async def _collect_loaded_files(cat) -> Dict[str, Dict[str, Any]]:
                 payload = record.payload or {}
                 meta = payload.get("metadata", {}) or {}
                 source = meta.get("source")
+
+                if _metadata_is_image(meta):
+                    # An image point's page_content is only "[Image] <source>":
+                    # an image chunk must never be forwarded to the LLM (this
+                    # preview becomes tool output in the conversation).
+                    continue
 
                 if not source:  # or source.startswith("http"):
                     continue

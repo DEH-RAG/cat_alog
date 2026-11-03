@@ -1560,4 +1560,176 @@ if __name__ == "__main__":
         "(w-d) replace must never purge a chunk that merely carries the flags"
     )
 
+    # ── (x) Source classification + parsed-text initial page ─────────────
+    assert cat_alog._is_textual_source("notes.md") is True
+    assert cat_alog._is_textual_source("notes.txt") is True
+    assert cat_alog._is_textual_source("page.html") is True
+    assert cat_alog._is_textual_source("rows.csv") is True
+    assert cat_alog._is_textual_source("report.pdf") is False
+    assert cat_alog._is_textual_source("slides.pptx") is False
+    assert cat_alog._is_textual_source("sheet.xlsx") is False
+    assert cat_alog._is_textual_source("scan.png") is False
+    assert cat_alog._is_textual_source("https://example.org/report.PDF?x=1") is False, (
+        "(x) a PDF URL must be binary (query string ignored)"
+    )
+    assert cat_alog._is_textual_source("https://example.org/notes.txt") is True
+    assert cat_alog._is_textual_source("unknown.weird") is True, (
+        "(x) an unknown extension keeps the textual default"
+    )
+
+    original_summary_x = cat_alog._run_summary_agent
+    original_embedder_x = cat_alog._resolve_embedder
+
+    async def _summary_x(cat, prompt):
+        return "CARD SUMMARY"
+
+    async def _embedder_x(cat):
+        return FakeEmbedder(100000)
+
+    cat_alog._run_summary_agent = _summary_x
+    cat_alog._resolve_embedder = _embedder_x
+    try:
+        # (a) PDF source: the card's initial page is the PARSED text, never the
+        # raw bytes (no ``%PDF`` header, no replacement-char garbage).
+        parsed_pdf = "PARSED PROSE about the motor and the mission. " * 8
+        pdf_bytes = (
+            b"%PDF-1.5\n1 0 obj\n<< /Type /Catalog >>\nstream\n"
+            b"\x00\xff\xfe binary %PDF garbage \xff\xfe\nendstream\n"
+        )
+        chunk_pdf = SimpleNamespace(payload={
+            "page_content": parsed_pdf,
+            "metadata": {"source": "doc.pdf", "chunk_index": 0},
+        })
+        handler_pdf = FakePhaseHandler({DEC: [chunk_pdf], EPS: []})
+        cat_pdf = FakeCat(
+            FakeFileManager([], files={("agent", "doc.pdf"): pdf_bytes}),
+            handler_pdf,
+            {},
+        )
+        assert asyncio.run(
+            cat_alog._run_catalog_cards_phase("doc.pdf", cat_pdf)
+        ) == {"status": "done"}, "(a) PDF card phase must complete"
+        _, card_points_pdf = handler_pdf.added[-1]
+        card_pdf = card_points_pdf[0].payload["page_content"]
+        initial_pdf = card_pdf.split("## Initial page\n\n", 1)[1].split(
+            "\n\n## Summary", 1
+        )[0]
+        assert initial_pdf.strip() == parsed_pdf.strip(), (
+            "(a) a PDF's initial page must be the parsed text"
+        )
+        assert "%PDF" not in initial_pdf, (
+            "(a) a PDF's initial page must not contain raw PDF bytes"
+        )
+        assert "\ufffd" not in initial_pdf, (
+            "(a) a PDF's initial page must not contain replacement chars"
+        )
+
+        # (d) The card fed to the concept/relation prompt is readable prose:
+        # its first 200 chars contain no binary marker and no replacement char.
+        card_head = card_pdf[:200]
+        assert "%PDF" not in card_head and "\ufffd" not in card_head, (
+            "(d) the PDF card head must not be binary"
+        )
+        assert any(ch.isalnum() for ch in card_head), (
+            "(d) the PDF card head must contain readable alphanumerics"
+        )
+        assert parsed_pdf[:120] in card_pdf, (
+            "(d) the parsed prose must be present in the card"
+        )
+
+        # (b) Markdown source: unchanged behaviour — the raw bytes ARE the text,
+        # so the initial page is the file content, not the parsed chunk.
+        md_bytes = b"# Raw markdown title\n\nRAW MARKDOWN BODY FROM THE FILE\n"
+        parsed_md = "PARSED CHUNK TEXT THAT MUST NOT BE THE PREVIEW"
+        chunk_md = SimpleNamespace(payload={
+            "page_content": parsed_md,
+            "metadata": {"source": "notes.md", "chunk_index": 0},
+        })
+        handler_md = FakePhaseHandler({DEC: [chunk_md], EPS: []})
+        cat_md = FakeCat(
+            FakeFileManager([], files={("agent", "notes.md"): md_bytes}),
+            handler_md,
+            {},
+        )
+        assert asyncio.run(
+            cat_alog._run_catalog_cards_phase("notes.md", cat_md)
+        ) == {"status": "done"}, "(b) markdown card phase must complete"
+        _, card_points_md = handler_md.added[-1]
+        card_md = card_points_md[0].payload["page_content"]
+        initial_md = card_md.split("## Initial page\n\n", 1)[1].split(
+            "\n\n## Summary", 1
+        )[0]
+        assert "RAW MARKDOWN BODY FROM THE FILE" in initial_md, (
+            "(b) markdown must keep the raw-bytes preview"
+        )
+        assert parsed_md not in initial_md, (
+            "(b) markdown must not switch to the parsed chunk"
+        )
+
+        # (c) A prose chunk that was leaked a catalogue-card flag must be
+        # cleaned in place: no card keys survive on the source chunk.
+        leak_meta = {
+            "source": "leak.pdf",
+            "chat_id": None,
+            "chunk_index": 0,
+            "start_index": 39735,
+            "source_chunks": [{"text": "piece"}],
+            "is_catalogue_card": True,
+            "is_catalogue_card_segment": True,
+            "full_card": "OLD CARD BODY",
+        }
+        chunk_leak = SimpleNamespace(
+            id="chunk-leak-not-card",
+            payload={
+                "page_content": "REAL PROSE BODY " * 20,
+                "metadata": dict(leak_meta),
+            },
+        )
+        handler_leak = FakePhaseHandler({DEC: [chunk_leak], EPS: []})
+        cat_leak = FakeCat(FakeFileManager([]), handler_leak, {})
+        assert asyncio.run(
+            cat_alog._run_catalog_cards_phase("leak.pdf", cat_leak)
+        ) == {"status": "done"}, "(c) leak card phase must complete"
+        meta_after_leak = chunk_leak.payload["metadata"]
+        for card_key in (
+            "is_catalogue_card", "is_catalogue_card_segment", "full_card",
+        ):
+            assert card_key not in meta_after_leak, (
+                f"(c) the prose chunk still leaks {card_key}"
+            )
+        assert "start_index" not in meta_after_leak, (
+            "(c) the card-derived start_index must be dropped from the chunk"
+        )
+        assert meta_after_leak.get("chunk_index") == 0, (
+            "(c) the chunk must keep its own chunk_index"
+        )
+        _, card_points_leak = handler_leak.added[-1]
+        assert card_points_leak[0].payload["metadata"].get(
+            "is_catalogue_card"
+        ) is True, "(c) the newly written card must still be flagged"
+        assert card_points_leak[0].id != "chunk-leak-not-card", (
+            "(c) the card must be a distinct point, not the chunk"
+        )
+
+        # A plain chunk (no stale flags) is never mutated by the phase.
+        plain_meta = {"source": "plain.pdf", "chunk_index": 0, "start_index": 0}
+        chunk_plain = SimpleNamespace(
+            id="chunk-plain",
+            payload={
+                "page_content": "PLAIN SOURCE PROSE",
+                "metadata": dict(plain_meta),
+            },
+        )
+        handler_plain = FakePhaseHandler({DEC: [chunk_plain], EPS: []})
+        cat_plain = FakeCat(FakeFileManager([]), handler_plain, {})
+        assert asyncio.run(
+            cat_alog._run_catalog_cards_phase("plain.pdf", cat_plain)
+        ) == {"status": "done"}, "(c) plain card phase must complete"
+        assert chunk_plain.payload["metadata"] == plain_meta, (
+            "(c) a plain chunk must keep its metadata untouched"
+        )
+    finally:
+        cat_alog._run_summary_agent = original_summary_x
+        cat_alog._resolve_embedder = original_embedder_x
+
     print("test_catalog_phase: ALL ASSERTIONS PASSED")
