@@ -657,6 +657,9 @@ async def ingestion_phase_run(phase, source, completed_phases, cat) -> Any:
 
     - ``{"status": "done"}``: the card was embedded and stored as a vector
       point with ``is_catalogue_card: True`` + ``full_card`` metadata;
+    - ``{"status": "done", "warnings": [...], "processed": 0}``: the phase RAN
+      over the source's existing chunks but produced no card (a tiny or
+      structural document may legitimately yield none) — complete, not retried;
     - ``{"status": "not_ready", "retry_after": 5}``: the source has no stored
       points yet, or the failure is transient (timeout/connection) — retry
       later;
@@ -685,6 +688,11 @@ def _phase_result_as_status(result: Any) -> Any:
         status = {"status": result.status}
         if result.reason is not None:
             status["reason"] = result.reason
+        if getattr(result, "processed", None) is not None:
+            status["processed"] = result.processed
+        warnings = getattr(result, "warnings", None)
+        if warnings:
+            status["warnings"] = warnings
         return status
     return result
 
@@ -758,12 +766,15 @@ async def _run_catalog_cards_phase(source, cat) -> Dict[str, Any]:
         return {"status": "not_ready", "retry_after": 5}
 
     embedder = await _resolve_embedder(cat)
+    total_chunks = 0
+    produced = 0
 
     for collection, chat_id, points in groups:
         chunks: List[str] = [
             (rec.payload or {}).get("page_content", "") or "" for rec in points
         ]
         chunks = [content for content in chunks if content.strip()]
+        total_chunks += len(chunks)
 
         first_metadata: Dict = dict(
             (points[0].payload or {}).get("metadata", {}) or {}
@@ -841,11 +852,32 @@ async def _run_catalog_cards_phase(source, cat) -> Dict[str, Any]:
             handler, collection, source, chat_id, "cat_alog", cat.agent_key
         )
         await handler.add_points_to_tenant(collection, points=card_points)
+        produced += len(card_points)
 
         log.info(
             f"cat_alog: catalogue card stored for '{source}' "
             f"in {collection} (chat={chat_id}, {len(card_points)} segment(s))"
         )
+
+    # The phase RAN (the source's chunks exist and every call succeeded) but no
+    # card came out: a tiny/structural document may legitimately extract to
+    # nothing. That is a WARNING on a ``done`` result, not an error — it is
+    # complete, so it is not retried and no dependent is blocked. "Could not
+    # run" (no chunks above, LLM failure) keeps its not_ready/error path.
+    if produced == 0:
+        return {
+            "status": "done",
+            "warnings": [
+                {
+                    "code": "empty-extraction",
+                    "message": (
+                        f"no catalogue card produced for '{source}' "
+                        f"from {total_chunks} chunk(s)"
+                    ),
+                }
+            ],
+            "processed": 0,
+        }
     return {"status": "done"}
 
 
@@ -862,7 +894,12 @@ def _phase_result_from_status(phase_id: str, result: Any):
                 status="error",
                 reason=f"phase '{phase_id}' returned invalid status {status!r}",
             )
-        return _PhaseResult(status=status, reason=result.get("reason"))
+        return _PhaseResult(
+            status=status,
+            reason=result.get("reason"),
+            processed=result.get("processed"),
+            warnings=result.get("warnings") or None,
+        )
     if result is None:
         return _PhaseResult(
             status="error", reason=f"phase '{phase_id}' has no run implementation"

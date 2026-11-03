@@ -187,11 +187,13 @@ if __name__ == "__main__":
             return _hashlib.sha256(f"{self.id}:{payload}".encode()).hexdigest()
 
     class _StubPhaseResult:
-        def __init__(self, status, reason=None, processed=None, expected=None):
+        def __init__(self, status, reason=None, processed=None, expected=None,
+                     warnings=None):
             self.status = status
             self.reason = reason
             self.processed = processed
             self.expected = expected
+            self.warnings = warnings
 
     stub_phases.IngestionPhase = _StubIngestionPhase
     stub_phases.PhaseResult = _StubPhaseResult
@@ -1036,6 +1038,107 @@ if __name__ == "__main__":
     assert "NotFoundError" in logged_u[0], "(u) log line must carry the exception class"
     assert len(logged_u) == 1, "(u) phase failure must be logged exactly once"
     assert not handler_u.added, "(u) a failed phase must not write a card"
+
+    # ── (w) Empty-output policy: a phase that RAN with chunks but produced
+    # ZERO cards is DONE + a warning, never an error. "Could not run" keeps
+    # its not_ready/error path.
+    class ZeroEmbedder(FakeEmbedder):
+        def embed_documents(self, texts):
+            return []
+
+    async def _zero_embedder(cat):
+        return ZeroEmbedder(None)
+
+    def _chunk(source, text="SOURCE BODY", chat_id=None, start_index=0):
+        metadata = {"source": source, "start_index": start_index}
+        if chat_id is not None:
+            metadata["chat_id"] = chat_id
+        return SimpleNamespace(payload={"page_content": text, "metadata": metadata})
+
+    original_summary_w = cat_alog._run_summary_agent
+    original_embedder_w = cat_alog._resolve_embedder
+    try:
+        cat_alog._run_summary_agent = _fake_summary_agent
+        cat_alog._resolve_embedder = _zero_embedder
+
+        # (w-a) Ran with chunks, produced 0 cards -> done + warning, no error.
+        handler_wa = FakePhaseHandler({DEC: [_chunk("empty.pdf")]})
+        cat_wa = FakeCat(FakeFileManager([]), handler_wa, {})
+        result_wa = asyncio.run(
+            cat_alog.ingestion_phase_run("catalog_cards", "empty.pdf", {}, cat_wa)
+        )
+        assert result_wa.get("status") == "done", (
+            "(w-a) an empty extraction must be done, not error/not_ready"
+        )
+        assert "reason" not in result_wa, "(w-a) a warning result must not carry a reason"
+        warnings_wa = result_wa.get("warnings")
+        assert isinstance(warnings_wa, list) and len(warnings_wa) == 1, (
+            "(w-a) exactly one warning must be attached", warnings_wa
+        )
+        warning_wa = warnings_wa[0]
+        assert warning_wa.get("code") == "empty-extraction", warning_wa
+        assert "'empty.pdf'" in warning_wa.get("message", ""), warning_wa
+        assert "1 chunk(s)" in warning_wa.get("message", ""), warning_wa
+        assert result_wa.get("processed") == 0, (
+            "(w-a) processed must report the 0 cards produced"
+        )
+
+        # The phase object carries the same warning on its result.
+        phase_wa = cat_alog.CatalogCardsPhase(cat_wa)
+        result_wa_obj = asyncio.run(phase_wa.process("empty.pdf", cat_wa))
+        assert result_wa_obj.status == "done", "(w-a) phase object must be done"
+        assert result_wa_obj.warnings == warnings_wa, (
+            "(w-a) the phase object must carry the warning"
+        )
+        assert result_wa_obj.reason is None, "(w-a) a warning is not a reason"
+
+        # (w-b) Chunks missing -> still not_ready (could not run).
+        handler_wb = FakePhaseHandler({})
+        cat_wb = FakeCat(FakeFileManager([]), handler_wb, {})
+        result_wb = asyncio.run(
+            cat_alog._run_catalog_cards_phase("missing.pdf", cat_wb)
+        )
+        assert result_wb == {"status": "not_ready", "retry_after": 5}, (
+            "(w-b) a source without chunks must stay not_ready", result_wb
+        )
+        phase_wb = cat_alog.CatalogCardsPhase(cat_wb)
+        assert asyncio.run(phase_wb.process("missing.pdf", cat_wb)).status == (
+            "not_ready"
+        ), "(w-b) the phase object must stay not_ready without chunks"
+
+        # (w-c) LLM failure -> still the current error path, no warning.
+        handler_wc = FakePhaseHandler({DEC: [_chunk("bad.pdf")]})
+        cat_wc = FakeCat(FakeFileManager([]), handler_wc, {})
+        cat_alog._run_summary_agent = _raise_not_found
+        cat_alog._resolve_embedder = _embedder_u
+        result_wc = asyncio.run(
+            cat_alog.ingestion_phase_run("catalog_cards", "bad.pdf", {}, cat_wc)
+        )
+        assert result_wc.get("status") == "error", (
+            "(w-c) an LLM failure must stay an error", result_wc
+        )
+        assert "NotFoundError" in result_wc.get("reason", ""), result_wc
+        assert "warnings" not in result_wc, "(w-c) an error must carry no warning"
+        assert not handler_wc.added, "(w-c) a failed phase must not write a card"
+
+        # (w-d) done + warnings is COMPLETE: no retry signal is produced, so
+        # the machine does not retry and dependents are not blocked.
+        cat_alog._run_summary_agent = _fake_summary_agent
+        cat_alog._resolve_embedder = _zero_embedder
+        result_wd = asyncio.run(phase_wa.process("empty.pdf", cat_wa))
+        assert result_wd.status == "done", (
+            "(w-d) done is the completion signal for a warned phase"
+        )
+        status_wd = cat_alog._phase_result_as_status(result_wd)
+        assert status_wd["status"] == "done", status_wd
+        assert status_wd.get("warnings") == warnings_wa, status_wd
+        assert "retry_after" not in status_wd, (
+            "(w-d) a warned phase must not request a retry", status_wd
+        )
+        assert "reason" not in status_wd, status_wd
+    finally:
+        cat_alog._run_summary_agent = original_summary_w
+        cat_alog._resolve_embedder = original_embedder_w
 
     # ── Phase ABC migration tests ──────────────────────────────────────────
     assert cat_alog.CatalogCardsPhase is not None, (
