@@ -1580,7 +1580,10 @@ if __name__ == "__main__":
     original_summary_x = cat_alog._run_summary_agent
     original_embedder_x = cat_alog._resolve_embedder
 
+    captured_prompts = []
+
     async def _summary_x(cat, prompt):
+        captured_prompts.append(prompt)
         return "CARD SUMMARY"
 
     async def _embedder_x(cat):
@@ -1727,6 +1730,151 @@ if __name__ == "__main__":
         ) == {"status": "done"}, "(c) plain card phase must complete"
         assert chunk_plain.payload["metadata"] == plain_meta, (
             "(c) a plain chunk must keep its metadata untouched"
+        )
+
+        # ── (y) PHASE: the summary prompt + initial page contain ONLY the
+        # parsed TEXT chunk. An image point, a binary chunk and a real
+        # catalogue card must never enter either.
+        captured_prompts.clear()
+        mixed_source = "mixed.pdf"
+        cat_alog.CATALOGUES.delete("agent", "chat", mixed_source)
+        text_body = "REAL TEXT BODY about the motor and the mission."
+        text_chunk = SimpleNamespace(payload={
+            "page_content": text_body,
+            "metadata": {"source": mixed_source, "chunk_index": 1, "start_index": 16},
+        })
+        image_point = SimpleNamespace(
+            id="img-point",
+            payload={
+                "page_content": f"[Image] {mixed_source}",
+                "metadata": {
+                    "source": mixed_source,
+                    "image": True,
+                    "image_file": "mixed_img.png",
+                    "image_mime_type": "image/png",
+                    "chunk_index": 2,
+                },
+            },
+        )
+        binary_chunk = SimpleNamespace(payload={
+            "page_content": "%PDF-1.5\n\x00\xff binary stream bytes",
+            "metadata": {"source": mixed_source, "chunk_index": 3},
+        })
+        mixed_card_id = cat_alog._catalogue_card_point_id(
+            "agent", None, mixed_source, 0
+        )
+        card_point = SimpleNamespace(
+            id=mixed_card_id,
+            payload={
+                "page_content": (
+                    "# CATALOGUE CARD\n\n## Initial page\n\n"
+                    "CARD INITIAL PAGE BODY\n\n## Summary\n\nCARD SUMMARY BODY\n"
+                ),
+                "metadata": {
+                    "source": mixed_source,
+                    "chunk_index": 0,
+                    "is_catalogue_card": True,
+                    "full_card": "CARD SUMMARY BODY",
+                },
+            },
+        )
+        handler_mixed = FakePhaseHandler({
+            DEC: [image_point, card_point, binary_chunk, text_chunk],
+            EPS: [],
+        })
+        cat_mixed = FakeCat(FakeFileManager([]), handler_mixed, {})
+        assert asyncio.run(
+            cat_alog._run_catalog_cards_phase(mixed_source, cat_mixed)
+        ) == {"status": "done"}, "(y) mixed phase must complete"
+        assert len(captured_prompts) == 1, captured_prompts
+        mixed_prompt = captured_prompts[0]
+        assert text_body in mixed_prompt, "(y) the text chunk must be summarized"
+        assert "[Image]" not in mixed_prompt, "(y) image point leaked into the prompt"
+        assert "CARD INITIAL PAGE BODY" not in mixed_prompt, (
+            "(y) card initial page leaked into the prompt"
+        )
+        assert "CARD SUMMARY BODY" not in mixed_prompt, (
+            "(y) card summary leaked into the prompt"
+        )
+        assert "%PDF" not in mixed_prompt, "(y) binary bytes leaked into the prompt"
+        mixed_card = handler_mixed.added[-1][1][0].payload["page_content"]
+        mixed_initial = mixed_card.split("## Initial page\n\n", 1)[1].split(
+            "\n\n## Summary", 1
+        )[0]
+        assert mixed_initial.strip() == text_body, (
+            "(y) the initial page must be the parsed text chunk only"
+        )
+
+        # ── (z) LEGACY HOOKS: same rule for the split-stage summary prompt and
+        # the stored card's initial page. ``docs[0]`` is an image on purpose:
+        # metadata must come from the first real TEXT document.
+        captured_prompts.clear()
+        legacy_source = "legacy-mixed.pdf"
+        cat_alog.CATALOGUES.delete("agent", "chat", legacy_source)
+        legacy_text = SimpleNamespace(
+            page_content="LEGACY REAL TEXT BODY.",
+            metadata={"source": legacy_source, "chunk_index": 3},
+        )
+        legacy_image = SimpleNamespace(
+            page_content=f"[Image] {legacy_source}",
+            metadata={
+                "source": legacy_source,
+                "image": True,
+                "image_file": "legacy_img.png",
+            },
+        )
+        legacy_card = SimpleNamespace(
+            page_content="# CATALOGUE CARD\n## Initial page\nLEGACY CARD BODY",
+            metadata={
+                "source": legacy_source,
+                "is_catalogue_card": True,
+                "full_card": "LEGACY CARD BODY",
+            },
+        )
+        legacy_binary = SimpleNamespace(
+            page_content="%PDF-1.5\n\x00 binary legacy bytes",
+            metadata={"source": legacy_source},
+        )
+        legacy_docs = [legacy_image, legacy_card, legacy_binary, legacy_text]
+        cat_legacy = FakeCat(FakeFileManager([]), FakePhaseHandler({DEC: [], EPS: []}), {})
+
+        original_gate_z = cat_alog._phase_machine_active
+
+        async def _gate_off_z(cat=None):
+            return False
+
+        cat_alog._phase_machine_active = _gate_off_z
+        try:
+            asyncio.run(
+                cat_alog.before_rabbithole_splits_documents(legacy_docs, cat_legacy)
+            )
+            assert len(captured_prompts) == 1, captured_prompts
+            legacy_prompt = captured_prompts[0]
+            assert "LEGACY REAL TEXT BODY." in legacy_prompt, (
+                "(z) the text chunk must be summarized"
+            )
+            assert "[Image]" not in legacy_prompt, "(z) image doc leaked into prompt"
+            assert "LEGACY CARD BODY" not in legacy_prompt, (
+                "(z) card doc leaked into prompt"
+            )
+            assert "%PDF" not in legacy_prompt, "(z) binary doc leaked into prompt"
+
+            stored = asyncio.run(
+                cat_alog.before_rabbithole_stores_documents(legacy_docs, cat_legacy)
+            )
+        finally:
+            cat_alog._phase_machine_active = original_gate_z
+
+        legacy_card_doc = stored[-1]
+        legacy_card_text = legacy_card_doc.page_content
+        legacy_initial = legacy_card_text.split("## Initial page\n\n", 1)[1].split(
+            "\n\n## Summary", 1
+        )[0]
+        assert legacy_initial.strip() == "LEGACY REAL TEXT BODY.", (
+            "(z) the stored card's initial page must be the text chunk only"
+        )
+        assert legacy_card_doc.metadata.get("image") is not True, (
+            "(z) the card must not inherit image metadata from docs[0]"
         )
     finally:
         cat_alog._run_summary_agent = original_summary_x

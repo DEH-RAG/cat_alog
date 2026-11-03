@@ -951,11 +951,20 @@ async def _run_catalog_cards_phase(source, cat) -> Dict[str, Any]:
         abstract = None
         if _is_textual_source(source):
             source_text = _decode_source(await _read_source_bytes(cat, source, chat_id))
-            if source_text is not None and source_text.strip():
+            if (
+                source_text is not None
+                and source_text.strip()
+                and not _looks_binary_text(source_text)
+            ):
                 abstract = source_text[:max_document_chars].strip()
                 log.info(
                     f"cat_alog: initial page for '{source}' (chat={chat_id}) from "
                     "the persisted raw bytes (textual source)."
+                )
+            elif source_text is not None and _looks_binary_text(source_text):
+                log.warning(
+                    f"cat_alog: persisted bytes for '{source}' (chat={chat_id}) look "
+                    "binary despite a textual extension; using the parsed chunks."
                 )
         if abstract is None:
             abstract = full_text.strip()
@@ -1441,7 +1450,14 @@ async def _collect_loaded_files(cat) -> Dict[str, Dict[str, Any]]:
                             with_vectors=False,
                         )
                         if records and records[0].payload:
+                            record_meta = (records[0].payload.get("metadata") or {})
+                            if _metadata_is_image(record_meta):
+                                # Never preview an image point's "[Image] …"
+                                # placeholder: image chunks are not source text.
+                                continue
                             content = (records[0].payload.get("page_content") or "")[:500]
+                            if _looks_binary_text(content):
+                                continue
                             if content:
                                 files_dict[source]["content"] = content
                                 log.debug(f"cat_alog: legacy fallback found preview for '{source}' ({match_key})")
