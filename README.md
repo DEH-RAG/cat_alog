@@ -9,6 +9,10 @@ The catalog card contains:
 - the first chunk of the document (to capture title and authors)
 - a brief summary of the file content, automatically summarized with the currently configured LLM.
 
+## Loaded files in the prompt
+
+The list shows each file's name, type (agent or conversation) and upload date, with no content previews. It is a no-op when nothing is loaded. The `list_loaded_files` tool remains the on-demand source of full content previews.
+
 ## Two ingestion modes and the gate rule
 
 Card generation has two mutually exclusive implementations, selected per ingestion by `_phase_machine_active(cat)`:
