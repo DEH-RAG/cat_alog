@@ -480,6 +480,19 @@ def _record_point_id(record) -> "Optional[str]":
     return str(point_id) if point_id is not None else None
 
 
+def _normalize_point_id(value: Any) -> str:
+    """Backend-agnostic spelling of a point id for identity comparison.
+
+    The product mints card ids as ``uuid5(...).hex`` (undashed), while a
+    vector store may hand the SAME uuid back in canonical dashed form (Qdrant
+    does). Comparing the raw strings then fails to recognise a card the
+    product itself wrote, so the phase purge would miss every stored segment
+    and leave orphans behind. Normalising both sides keeps the identity check
+    independent of the store's formatting.
+    """
+    return str(value).replace("-", "").lower()
+
+
 def _catalogue_card_id_from_metadata(meta: Dict, agent_key: str) -> "Optional[str]":
     """The deterministic card id a record's OWN metadata describes.
 
@@ -515,7 +528,7 @@ def _is_catalogue_card_record(meta: Dict, point_id: "Optional[str]", agent_key: 
     if not meta.get("is_catalogue_card") or point_id is None:
         return False
     expected = _catalogue_card_id_from_metadata(meta, agent_key)
-    return expected is not None and str(point_id) == expected
+    return expected is not None and _normalize_point_id(point_id) == _normalize_point_id(expected)
 
 
 def _strip_card_metadata_in_place(meta: Dict) -> Dict:

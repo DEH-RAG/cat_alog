@@ -1880,4 +1880,175 @@ if __name__ == "__main__":
         cat_alog._run_summary_agent = original_summary_x
         cat_alog._resolve_embedder = original_embedder_x
 
+    # ── (y) Qdrant-canonical (dashed) UUID ids: the phase purge must still
+    # recognise the source's stored cards and replace them EXACTLY. Qdrant
+    # returns point ids as canonical dashed UUID strings while the product
+    # mints ``uuid5(...).hex`` (undashed): identity must normalise both forms,
+    # otherwise the purge never matches and a changed embedder window leaves
+    # the old segments as orphans.
+    import uuid as _uuid_y
+
+    def _dashed_y(point_id):
+        return str(_uuid_y.UUID(str(point_id)))
+
+    class QdrantCanonicalHandler(FakePhaseHandler):
+        """Fake store returning dashed ids and upserting by id, like Qdrant."""
+
+        async def add_points_to_tenant(self, collection_name, points):
+            points = list(points)
+            self.added.append((collection_name, points))
+            store = self.by_collection.setdefault(collection_name, [])
+            index = {
+                _dashed_y(record.id): position
+                for position, record in enumerate(store)
+                if getattr(record, "id", None) is not None
+            }
+            for point in points:
+                point_id = _dashed_y(point.id)
+                record = SimpleNamespace(id=point_id, payload=point.payload)
+                if point_id in index:
+                    store[index[point_id]] = record
+                else:
+                    index[point_id] = len(store)
+                    store.append(record)
+
+    base_y = cat_alog._catalogue_card_point_id("agent", None, "dash.txt")
+    assert cat_alog._is_catalogue_card_record(
+        {"source": "dash.txt", "is_catalogue_card": True}, base_y, "agent",
+    ) is True
+    assert cat_alog._is_catalogue_card_record(
+        {"source": "dash.txt", "is_catalogue_card": True}, _dashed_y(base_y), "agent",
+    ) is True, "(y) a dashed UUID card id must still be recognised"
+
+    window_y = FakeEmbedder(37)
+
+    async def _embedder_y(cat):
+        return window_y
+
+    async def _summary_y(cat, prompt):
+        return " ".join(f"w{i}" for i in range(300))
+
+    original_summary_y = cat_alog._run_summary_agent
+    original_embedder_y = cat_alog._resolve_embedder
+    cat_alog._run_summary_agent = _summary_y
+    cat_alog._resolve_embedder = _embedder_y
+    try:
+        handler_y = QdrantCanonicalHandler({
+            DEC: [SimpleNamespace(id=_uuid_y.uuid4().hex, payload={
+                "page_content": "DASH CHUNK",
+                "metadata": {"source": "dash.txt", "chunk_index": 0},
+            })],
+            EPS: [SimpleNamespace(id=_uuid_y.uuid4().hex, payload={
+                "page_content": "DASH CHAT CHUNK",
+                "metadata": {
+                    "source": "dash.txt", "chat_id": "chatY", "chunk_index": 0,
+                },
+            })],
+        })
+        fm_y = FakeFileManager([], files={
+            ("agent", "dash.txt"): b"DASH PAGE " * 400,
+            ("agent/chatY", "dash.txt"): b"DASH CHAT PAGE " * 200,
+        })
+        cat_y = FakeCat(fm_y, handler_y, {})
+
+        def _cards_y(collection):
+            return [
+                record
+                for record in handler_y.by_collection.get(collection, [])
+                if ((record.payload or {}).get("metadata", {}) or {}).get("source")
+                == "dash.txt"
+                and ((record.payload or {}).get("metadata", {}) or {}).get(
+                    "is_catalogue_card"
+                ) is True
+            ]
+
+        def _ids_y(collection, chat_id):
+            return {
+                _dashed_y(record.id)
+                for record in _cards_y(collection)
+                if ((record.payload or {}).get("metadata", {}) or {}).get("chat_id")
+                == chat_id
+            }
+
+        def _run_y():
+            result = asyncio.run(
+                cat_alog.ingestion_phase_run("catalog_cards", "dash.txt", {}, cat_y)
+            )
+            assert result == {"status": "done"}, "(y) phase did not finish"
+
+        _run_y()
+        first_dec = _ids_y(DEC, None)
+        first_eps = _ids_y(EPS, "chatY")
+        assert len(first_dec) > 1 and len(first_eps) > 1, (
+            "(y) window 37 did not segment the card"
+        )
+
+        # (a) changed window -> EXACTLY the new segment count, no orphan.
+        window_y.max_input_tokens = 23
+        _run_y()
+        second_dec = _ids_y(DEC, None)
+        second_eps = _ids_y(EPS, "chatY")
+        assert len(second_dec) > len(first_dec), "(y) lower window must add segments"
+        assert first_dec - second_dec, "(y) old agent-scoped segment ids survived"
+        assert _ids_y(DEC, None) == second_dec, (
+            "(y) old agent-scoped segments survived the lower-window re-run"
+        )
+        assert len(_cards_y(DEC)) == len(second_dec), (
+            "(y) orphan agent-scoped segments left next to the new card",
+            len(_cards_y(DEC)), len(second_dec),
+        )
+        assert len(_cards_y(EPS)) == len(second_eps), (
+            "(y) orphan chat-scoped segments left next to the new card"
+        )
+
+        # (b) identical ids re-run -> count unchanged (no duplicates/orphans).
+        _run_y()
+        assert _ids_y(DEC, None) == second_dec, (
+            "(y) an identical-id re-run changed the agent-scoped segment set"
+        )
+        assert len(_cards_y(DEC)) == len(second_dec), (
+            "(y) an identical-id re-run changed the agent-scoped count"
+        )
+        assert len(_cards_y(EPS)) == len(second_eps), (
+            "(y) an identical-id re-run changed the chat-scoped count"
+        )
+
+        # (c) the purge never deletes a non-card point carrying the card flags.
+        flagged_id = "flagged-chunk-not-card"
+        card_dashed = _dashed_y(
+            cat_alog._catalogue_card_point_id("agent", None, "purgey.txt")
+        )
+        purge_handler = QdrantCanonicalHandler({DEC: [
+            SimpleNamespace(id=card_dashed, payload={"metadata": {
+                "source": "purgey.txt", "is_catalogue_card": True,
+            }}),
+            SimpleNamespace(id=flagged_id, payload={"metadata": {
+                "source": "purgey.txt", "chunk_index": 0,
+                "is_catalogue_card": True, "full_card": "stale card body",
+            }}),
+        ]})
+        removed_y = asyncio.run(cat_alog._purge_existing_cards(
+            purge_handler, DEC, "purgey.txt", None, "test", "agent",
+        ))
+        remaining_y = {record.id for record in purge_handler.by_collection[DEC]}
+        assert removed_y == 1 and card_dashed not in remaining_y, (
+            "(y) the purge must delete a dashed-id card point"
+        )
+        assert flagged_id in remaining_y, (
+            "(y) the purge must never delete a non-card point carrying the flags"
+        )
+
+        # (d) running twice more is idempotent in count.
+        _run_y()
+        _run_y()
+        assert len(_cards_y(DEC)) == len(second_dec), (
+            "(y) repeated runs must be idempotent"
+        )
+        assert len(_cards_y(EPS)) == len(second_eps), (
+            "(y) repeated chat-scoped runs must be idempotent"
+        )
+    finally:
+        cat_alog._run_summary_agent = original_summary_y
+        cat_alog._resolve_embedder = original_embedder_y
+
     print("test_catalog_phase: ALL ASSERTIONS PASSED")
