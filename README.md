@@ -62,6 +62,6 @@ With `append_file_list_to_prompt` enabled, `agent_prompt_suffix` appends a compa
 ## Commands
 
 - Run the standalone test suite: `python test_catalog_phase.py` (prints `test_catalog_phase: ALL ASSERTIONS PASSED` on success)
-- Run the real-plugin-manager integration test from the host checkout: `cd /root/git/grinning-cat-core && .venv/bin/python /root/git/plugins/cat_alog/test_catalog_phase_integration.py`
+- Run the real-plugin-manager integration test from the MyCAT integration checkout: `cd /root/git/grinning-cat-core && .venv/bin/python /root/git/plugins/cat_alog/test_catalog_phase_integration.py`
 - Run the leaked-card-metadata cleanup (dry-run by default; `--yes` writes): `python scripts/fix_leaked_card_metadata.py --dry-run`
 
