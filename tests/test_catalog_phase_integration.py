@@ -15,7 +15,7 @@ and importing this file executes zero code. Run it as a plain script from the
 host checkout:
 
     cd /root/git/grinning-cat-core
-    .venv/bin/python /root/git/plugins/cat_alog/test_catalog_phase_integration.py
+    .venv/bin/python /root/git/plugins/cat_alog/tests/test_catalog_phase_integration.py
 
 Why no conftest symlink
 -----------------------
@@ -94,7 +94,9 @@ if __name__ == "__main__":
     from cat.startup import create_app
 
     PLUGIN_ID = "cat_alog"
-    PLUGIN_DIR = Path("/root/git/plugins/cat_alog")
+    #: The plugin root: this file lives in ``tests/`` after the move.
+    REPO_ROOT = Path(__file__).resolve().parent.parent
+    PLUGIN_DIR = REPO_ROOT
     AGENT_ID = f"catalog_phase_integration_{uuid.uuid4().hex[:10]}"
 
 

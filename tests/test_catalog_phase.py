@@ -15,7 +15,11 @@ if __name__ == "__main__":
     import sys
     import types
     from datetime import datetime
+    from pathlib import Path
     from types import SimpleNamespace
+
+    #: The plugin root: this file lives in ``tests/`` after the move.
+    REPO_ROOT = Path(__file__).resolve().parent.parent
 
     # ── sys.modules stubs for the `cat` package surface ──────────────────
     # Installed BEFORE `import cat_alog` so the module import has zero
@@ -164,12 +168,12 @@ if __name__ == "__main__":
     # split.py, so the token-budget segmentation below is unchanged.
     sys.modules["langchain_core.documents"].Document = Document
     log_mod.log = log_mod
-    sys.path.insert(0, "/root/git/plugins/cat-efficient-ingestion")
+    sys.path.insert(0, "/root/git/plugins/cat-efficient-ingestion/tests")
     import effing_testkit  # noqa: E402
 
     _EFFING_PHASES_KEY = "cat.core_plugins.cat_efficient_ingestion.phases"
 
-    sys.path.insert(0, "/root/git/plugins/cat_alog")
+    sys.path.insert(0, str(REPO_ROOT))
     effing_testkit.install_stub_package()
     try:
         import cat_alog  # noqa: E402

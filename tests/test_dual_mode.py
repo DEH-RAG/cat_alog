@@ -8,7 +8,7 @@ plugin folder, so the ENTIRE body lives inside ``if __name__ == "__main__":``
 and importing this file executes zero code. Run it from the host checkout:
 
     cd /root/git/grinning-cat-core
-    .venv/bin/python /root/git/plugins/cat_alog/test_dual_mode.py
+    .venv/bin/python /root/git/plugins/cat_alog/tests/test_dual_mode.py
 
 Isolation
 ---------
@@ -60,9 +60,13 @@ if __name__ == "__main__":
 
     PLUGINS_ROOT = Path("/root/git/plugins")
 
+    #: The plugin root: this file lives in ``tests/`` after the move.
+    REPO_ROOT = Path(__file__).resolve().parent.parent
+
     # effing_testkit is published by the EffING plugin: the shared, import-safe
-    # doubles for the phase contract consumed by cat_alog.
-    _effing_dir = str(PLUGINS_ROOT / "cat-efficient-ingestion")
+    # doubles for the phase contract consumed by cat_alog. It now lives in the
+    # plugin's ``tests/`` directory.
+    _effing_dir = str(PLUGINS_ROOT / "cat-efficient-ingestion" / "tests")
     if _effing_dir not in sys.path:
         sys.path.insert(0, _effing_dir)
     import effing_testkit
@@ -144,7 +148,7 @@ if __name__ == "__main__":
 
     CORE_PLUGINS_DIR = os.path.join("cat", "core_plugins")
     PLUGIN_LINKS = {
-        "cat_alog": str(PLUGINS_ROOT / "cat_alog"),
+        "cat_alog": str(REPO_ROOT),
         "cat_efficient_ingestion": str(PLUGINS_ROOT / "cat-efficient-ingestion"),
         "cat_multimodal_ingestion": str(PLUGINS_ROOT / "cat-multimodal-ingestion"),
     }
