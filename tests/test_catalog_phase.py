@@ -12,6 +12,8 @@ importing this file executes zero code. Pure stdlib only.
 if __name__ == "__main__":
     import asyncio
     import enum
+    import importlib.util
+    import os
     import sys
     import types
     from datetime import datetime
@@ -66,6 +68,7 @@ if __name__ == "__main__":
         return wrap
 
 
+    cat_mod.__path__ = []
     cat_mod.hook = _deco
     cat_mod.plugin = _deco
     cat_mod.tool = _deco
@@ -95,21 +98,6 @@ if __name__ == "__main__":
     cat_memory_models.PointStruct = PointStruct
     cat_memory.models = cat_memory_models
     cat_services.memory = cat_memory
-
-    # `cat.services.factory.ingestion.resolved_config_name` (SYSTEM-level
-    # ingestion engine resolver used by the phase gate). Mutable so the three
-    # truth-table rows can be exercised without re-importing cat_alog.
-    RESOLVED_INGESTION = {"name": "EfficientIngestionConfiguration"}
-
-    cat_factory = types.ModuleType("cat.services.factory")
-    cat_factory.__path__ = []
-    ingestion_factory = types.ModuleType("cat.services.factory.ingestion")
-
-    async def _fake_resolved_config_name(lizard):
-        return RESOLVED_INGESTION["name"]
-
-    ingestion_factory.resolved_config_name = _fake_resolved_config_name
-    cat_services.factory = cat_factory
 
     cat_plugins = types.ModuleType("cat.plugins")
 
@@ -154,36 +142,83 @@ if __name__ == "__main__":
     sys.modules["cat.services"] = cat_services
     sys.modules["cat.services.memory"] = cat_memory
     sys.modules["cat.services.memory.models"] = cat_memory_models
-    sys.modules["cat.services.factory"] = cat_factory
-    sys.modules["cat.services.factory.ingestion"] = ingestion_factory
     sys.modules["cat.plugins"] = cat_plugins
     sys.modules["cat.db"] = cat_db
     sys.modules["cat.db.crud"] = cat_db.crud
     sys.modules["cat.db.cruds"] = cat_db_cruds
     sys.modules["cat.db.cruds.settings"] = cat_db_settings
 
-    # EffING's phase contract comes from the published testkit: it installs the
-    # real package when the host provides one and synthesizes the canonical
-    # package for a bare checkout. Its `.split` is built from EffING's real
-    # split.py, so the token-budget segmentation below is unchanged.
+    # The core ingestion protocol is the source of truth: load the REAL
+    # `cat/rabbit_hole/{phases,split}.py` from the host checkout instead of
+    # duplicating the contract here. Only the couple of host modules they
+    # import are stubbed above.
+    def _core_file(relative):
+        candidates = []
+        core_root = os.environ.get("CAT_CORE_ROOT")
+        if core_root:
+            candidates.append(Path(core_root))
+        candidates.extend([Path.cwd(), Path("/root/git/grinning-cat-core")])
+        for root in candidates:
+            candidate = root / relative
+            if candidate.is_file():
+                return candidate
+        raise RuntimeError(
+            f"cat_alog test: cannot find the core file {relative!r}; "
+            "run from the grinning-cat-core checkout or set CAT_CORE_ROOT"
+        )
+
+    def _load_core_module(name, relative):
+        spec = importlib.util.spec_from_file_location(name, _core_file(relative))
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    cat_db_database = _types.ModuleType("cat.db.database")
+    cat_db_database.DEFAULT_SYSTEM_KEY = "system:agent"
+    sys.modules["cat.db.database"] = cat_db_database
+
+    cat_utils = _types.ModuleType("cat.utils")
+    cat_utils.SUFFIX_TO_CRYPT = ()
+    sys.modules["cat.utils"] = cat_utils
+
+    cat_env = _types.ModuleType("cat.env")
+    cat_env.get_env_int = lambda name: None
+    sys.modules["cat.env"] = cat_env
+
     sys.modules["langchain_core.documents"].Document = Document
     log_mod.log = log_mod
-    sys.path.insert(0, "/root/git/plugins/cat-efficient-ingestion/tests")
-    import effing_testkit  # noqa: E402
 
-    _EFFING_PHASES_KEY = "cat.core_plugins.cat_efficient_ingestion.phases"
+    rabbit_hole = types.ModuleType("cat.rabbit_hole")
+    rabbit_hole.__path__ = []
+    sys.modules["cat.rabbit_hole"] = rabbit_hole
+
+    _load_core_module("cat.rabbit_hole.phases", "cat/rabbit_hole/phases.py")
+    _load_core_module("cat.rabbit_hole.split", "cat/rabbit_hole/split.py")
+
+    # `read_source_bytes` returns the bytes the host kept for a source (the
+    # uploaded file or the RabbitHole copy); the fake file manager below
+    # implements the same contract.
+    chunks_mod = types.ModuleType("cat.rabbit_hole.chunks")
+
+    def _fake_read_source_bytes(file_manager, agent_id, chat_id, source):
+        folder = os.path.join(agent_id, str(chat_id)) if chat_id else agent_id
+        if not str(source).startswith(("http://", "https://")):
+            data = file_manager.read_file(source, folder)
+            if data is not None:
+                return data
+        import hashlib as _hashlib
+
+        return file_manager.read_file(
+            _hashlib.sha256(str(source).encode()).hexdigest() + ".source", folder
+        )
+
+    chunks_mod.read_source_bytes = _fake_read_source_bytes
+    sys.modules["cat.rabbit_hole.chunks"] = chunks_mod
 
     sys.path.insert(0, str(REPO_ROOT))
-    effing_testkit.install_stub_package()
     try:
         import cat_alog  # noqa: E402
-
-        # The class is defined against the testkit ABC; the phases module is
-        # hidden so `_phase_machine_active` keeps taking the classic path until
-        # test (q).
-        import cat.core_plugins.cat_efficient_ingestion as _effing_pkg  # noqa: E402
-        sys.modules.pop(_EFFING_PHASES_KEY, None)
-        del _effing_pkg.phases
 
         # ── Fake cat surface ──────────────────────────────────────────────────
         CARD_TEXT = (
@@ -362,6 +397,12 @@ if __name__ == "__main__":
         assert "**Content preview:**" not in compact, "(c) compact must not contain previews"
 
         # ── (d) Hook append: leading "\n\n" preserved, no strip ───────────────
+        INGESTION_KEYS[:] = ["agents:agent:ingestion:agent:report"]
+        INGESTION_ROWS.clear()
+        INGESTION_ROWS["agents:agent:ingestion:agent:report"] = {
+            "source": "report.pdf", "scope": "agent", "type": "file",
+            "status": "completed", "updated_at": 1234567890.0,
+        }
         out_d = asyncio.run(cat_alog.agent_prompt_suffix("", cat))
         assert out_d == "\n\n" + compact, "(d) hook append mismatch"
 
@@ -370,20 +411,22 @@ if __name__ == "__main__":
         assert out_e == "EXISTING SUFFIX\n\n" + compact, "(e) hook existing-suffix mismatch"
 
         # ── (f) Empty no-op ───────────────────────────────────────────────────
+        INGESTION_KEYS[:] = []
+        INGESTION_ROWS.clear()
         out_f = asyncio.run(cat_alog.agent_prompt_suffix("x", empty_cat))
         assert out_f == "x", "(f) empty no-op mismatch"
 
         # ── (g) Raising collector: hook swallows and returns suffix unchanged ─
-        original_collect = cat_alog._collect_loaded_files
+        original_collect = cat_alog._collect_ingestion_sources
         try:
             async def _boom(cat):
                 raise RuntimeError("boom")
 
-            cat_alog._collect_loaded_files = _boom
+            cat_alog._collect_ingestion_sources = _boom
             out_g = asyncio.run(cat_alog.agent_prompt_suffix("x", cat))
             assert out_g == "x", "(g) raising-collector no-op mismatch"
         finally:
-            cat_alog._collect_loaded_files = original_collect
+            cat_alog._collect_ingestion_sources = original_collect
 
         # ── Tool empty output via the tool itself ─────────────────────────────
         assert cat_alog.list_loaded_files(empty_cat) == (
@@ -391,11 +434,13 @@ if __name__ == "__main__":
         ), "tool empty output mismatch"
 
         # ── (h) Hook escapes braces in file names (core does system_prompt.format) ─
-        brace_cat = build_cat(with_file=True)
-        brace_cat.file_manager.agent_files = [
-            SimpleNamespace(name="report{2024}.pdf", last_modified=1234567890.0)
-        ]
-        out_h = asyncio.run(cat_alog.agent_prompt_suffix("", brace_cat))
+        INGESTION_KEYS[:] = ["agents:agent:ingestion:agent:brace"]
+        INGESTION_ROWS.clear()
+        INGESTION_ROWS["agents:agent:ingestion:agent:brace"] = {
+            "source": "report{2024}.pdf", "scope": "agent", "type": "file",
+            "status": "completed", "updated_at": 1234567890.0,
+        }
+        out_h = asyncio.run(cat_alog.agent_prompt_suffix("", cat))
         assert "report{{2024}}.pdf" in out_h, "(h) braces not escaped in hook output"
         _ = "{}".format(out_h)  # must not raise on the escaped listing
 
@@ -417,20 +462,20 @@ if __name__ == "__main__":
         off_cat = build_cat(
             with_file=True, settings={"append_file_list_to_prompt": False}
         )
-        original_collect_j = cat_alog._collect_loaded_files
+        original_collect_j = cat_alog._collect_ingestion_sources
 
         async def _must_not_collect(cat):
             raise AssertionError("collector must not run when the setting is off")
 
         try:
-            cat_alog._collect_loaded_files = _must_not_collect
+            cat_alog._collect_ingestion_sources = _must_not_collect
             out_j = asyncio.run(cat_alog.agent_prompt_suffix("KEEP", off_cat))
         finally:
-            cat_alog._collect_loaded_files = original_collect_j
+            cat_alog._collect_ingestion_sources = original_collect_j
         assert out_j == "KEEP", "(j) setting off must leave the prompt untouched"
         assert off_cat.vector_memory_handler.calls == 0, "(j) no vector query when off"
 
-        # ── (k) Setting ON + phase path: list comes from ingestion status rows ──
+        # ── (k) Setting ON: the ingestion status registry is the source list ──
         INGESTION_KEYS[:] = [
             "agents:agent:ingestion:agent:aaa",
             "agents:agent:ingestion:agent:bbb",
@@ -460,23 +505,14 @@ if __name__ == "__main__":
             },
         })
         phase_cat = build_cat(with_file=True)
-        original_phase_k = cat_alog._phase_machine_active
-
-        async def _phase_on(cat=None):
-            return True
-
-        try:
-            cat_alog._phase_machine_active = _phase_on
-            out_k = asyncio.run(cat_alog.agent_prompt_suffix("x", phase_cat))
-        finally:
-            cat_alog._phase_machine_active = original_phase_k
+        out_k = asyncio.run(cat_alog.agent_prompt_suffix("x", phase_cat))
         assert "lesson1.pdf" in out_k, "(k) status source missing from list"
         assert out_k.count("lesson1.pdf") == 1, "(k) duplicate source listed twice"
         assert "https://example.test/slides" in out_k, "(k) URL source missing"
         assert "chatfile.pdf" not in out_k, "(k) non-AGENT-scope row leaked"
         assert "delete" not in out_k.lower(), "(k) deletion marker listed as a file"
         assert phase_cat.vector_memory_handler.calls == 0, (
-            "(k) phase path must not run the classic vector collector"
+            "(k) the status path must not run the vector collector"
         )
 
         # ── (l) Extracted image never listed; whole-image source stays ──────────
@@ -499,33 +535,23 @@ if __name__ == "__main__":
             FakeVectorMemoryHandler(image_records),
             {},
         )
-        original_phase_l = cat_alog._phase_machine_active
-
-        async def _phase_off(cat=None):
-            return False
-
-        try:
-            cat_alog._phase_machine_active = _phase_off
-            out_l = asyncio.run(cat_alog.agent_prompt_suffix("x", img_cat))
-        finally:
-            cat_alog._phase_machine_active = original_phase_l
+        out_l = cat_alog.list_loaded_files(img_cat)
         assert "original_img_0_abcd.jpg" not in out_l, (
             "(l) image extracted from a file was listed"
         )
         assert "original.pdf" in out_l, "(l) the source file itself disappeared"
         assert "photo.jpg" in out_l, "(l) an image that IS the source must stay"
 
-        # ── (m) Deterministic card id shared by the phase and the classic hook ──
-        classic_cat = build_cat(with_file=True)
-        cat_alog.CATALOGUES.set("agent", classic_cat.id, "report.pdf", "S")
-        out_m = asyncio.run(cat_alog.before_rabbithole_stores_documents(
-            [Document(page_content="chunk text", metadata={"source": "report.pdf"})],
-            classic_cat,
-        ))
-        cards_m = [d for d in out_m if d.metadata.get("is_catalogue_card") is True]
-        assert len(cards_m) == 1, "(m) classic card missing"
-        assert cards_m[0].id == cat_alog._catalogue_card_point_id("agent", classic_cat.id, "report.pdf"), (
-            "(m) classic card does not use the shared deterministic id"
+        # ── (m) Deterministic card id: stable, tenant- and chat-scoped ─────────
+        id_m = cat_alog._catalogue_card_point_id("agent", "chat", "report.pdf")
+        assert id_m == cat_alog._catalogue_card_point_id("agent", "chat", "report.pdf"), (
+            "(m) the card id must be deterministic"
+        )
+        assert id_m != cat_alog._catalogue_card_point_id("agent", "other", "report.pdf"), (
+            "(m) the same source in two chats must not collide"
+        )
+        assert id_m != cat_alog._catalogue_card_point_id("other", "chat", "report.pdf"), (
+            "(m) the same source in two agents must not collide"
         )
 
         # The testkit already installed EffING's real token-budget splitter under
@@ -534,6 +560,16 @@ if __name__ == "__main__":
 
         DEC = str(VectorMemoryType.DECLARATIVE)
         EPS = str(VectorMemoryType.EPISODIC)
+
+        def _source(name, cat, chat_id=None):
+            return cat_alog.IngestionSource(
+                agent_id=cat.agent_key, chat_id=chat_id, name=name,
+            )
+
+        def _run_phase(name, cat, chat_id=None):
+            return asyncio.run(
+                cat_alog.CatalogCardsPhase().process(_source(name, cat, chat_id), cat)
+            )
 
         class FakeEmbedder:
             def __init__(self, max_tokens=20):
@@ -568,10 +604,8 @@ if __name__ == "__main__":
             phase_handler = FakePhaseHandler({EPS: [chunk_late, chunk_first]})
             phase_cat = FakeCat(FakeFileManager([]), phase_handler, {})
 
-            result_n = asyncio.run(
-                cat_alog.ingestion_phase_run("catalog_cards", "chat.pdf", {}, phase_cat)
-            )
-            assert result_n == {"status": "done"}, "(n) phase did not finish"
+            result_n = _run_phase("chat.pdf", phase_cat)
+            assert result_n.status == "done", "(n) phase did not finish"
             assert len(phase_handler.added) == 1, "(n) expected one upsert batch"
             collection_n, points_n = phase_handler.added[0]
             assert collection_n == EPS, "(n) chat-scoped card must land in EPISODIC"
@@ -599,9 +633,7 @@ if __name__ == "__main__":
             assert "uuid4" not in repr(ids_n)
 
             phase_handler.added.clear()
-            asyncio.run(
-                cat_alog.ingestion_phase_run("catalog_cards", "chat.pdf", {}, phase_cat)
-            )
+            _run_phase("chat.pdf", phase_cat)
             assert [p.id for p in phase_handler.added[0][1]] == ids_n, (
                 "(n) re-run must upsert the same ids"
             )
@@ -625,10 +657,8 @@ if __name__ == "__main__":
                 return FakeEmbedder(None)
 
             cat_alog._resolve_embedder = _no_limit_embedder
-            result_o = asyncio.run(
-                cat_alog.ingestion_phase_run("catalog_cards", "lesson.txt", {}, cat_o)
-            )
-            assert result_o == {"status": "done"}, "(o) phase did not finish"
+            result_o = _run_phase("lesson.txt", cat_o)
+            assert result_o.status == "done", "(o) phase did not finish"
             collection_o, points_o = handler_o.added[0]
             assert collection_o == DEC, "(o) agent-scoped card must land in DECLARATIVE"
             full_card_o = points_o[0].payload["metadata"]["full_card"]
@@ -661,10 +691,8 @@ if __name__ == "__main__":
 
             cat_alog._run_summary_agent = _echo_summary
             cat_alog._resolve_embedder = _fake_resolve_embedder
-            result_t = asyncio.run(
-                cat_alog.ingestion_phase_run("catalog_cards", "same.pdf", {}, cat_t)
-            )
-            assert result_t == {"status": "done"}, "(t) phase did not finish"
+            result_t = _run_phase("same.pdf", cat_t)
+            assert result_t.status == "done", "(t) phase did not finish"
             assert len(handler_t.added) == 2, (
                 "(t) two chats of one source must produce two card writes"
             )
@@ -693,10 +721,8 @@ if __name__ == "__main__":
             fm_u = FakeFileManager([], files={("agent", "big.txt"): b"PAGE " * 400})
             cat_u = FakeCat(fm_u, handler_u, {})
             cat_alog._resolve_embedder = _fake_resolve_embedder
-            result_u = asyncio.run(
-                cat_alog.ingestion_phase_run("catalog_cards", "big.txt", {}, cat_u)
-            )
-            assert result_u == {"status": "done"}, "(u) phase did not finish"
+            result_u = _run_phase("big.txt", cat_u)
+            assert result_u.status == "done", "(u) phase did not finish"
             _, points_u = handler_u.added[0]
             assert len(points_u) > 1, "(u) oversized card was not segmented"
             for point_u in points_u:
@@ -714,9 +740,7 @@ if __name__ == "__main__":
             assert len(set(ids_u)) == len(ids_u), "(u) duplicate segment ids"
 
             handler_u.added.clear()
-            asyncio.run(
-                cat_alog.ingestion_phase_run("catalog_cards", "big.txt", {}, cat_u)
-            )
+            _run_phase("big.txt", cat_u)
             assert [p.id for p in handler_u.added[0][1]] == ids_u, (
                 "(u) a re-run must reproduce the same segment ids"
             )
@@ -774,19 +798,15 @@ if __name__ == "__main__":
                 )
 
             # A third source's card, produced before the window changes.
-            asyncio.run(
-                cat_alog.ingestion_phase_run("catalog_cards", "other.txt", {}, cat_v)
-            )
+            _run_phase("other.txt", cat_v)
             other_ids_before = _card_ids_v(DEC, None, source="other.txt")
             assert other_ids_before, "(v) other source card was not produced"
 
             def _run_win():
                 handler_v.added.clear()
                 handler_v.deleted.clear()
-                result = asyncio.run(
-                    cat_alog.ingestion_phase_run("catalog_cards", "win.txt", {}, cat_v)
-                )
-                assert result == {"status": "done"}, "(v) phase did not finish"
+                result = _run_phase("win.txt", cat_v)
+                assert result.status == "done", "(v) phase did not finish"
                 return {collection: list(points) for collection, points in handler_v.added}
 
             first = _run_win()
@@ -848,93 +868,67 @@ if __name__ == "__main__":
                 if ((r.payload or {}).get("metadata", {}) or {}).get("source") == "other.txt"
             ) == other_ids_before, "(v) a different source's card was deleted/replaced"
 
-            # ── (p) Marker: LLM + sizes + prompt; cache tuning is NOT material ──
+            # ── (p) settings(): LLM + sizes + prompt; unrelated tuning is not material ──
             LLM_SETTINGS["agent"] = {"name": "LLMConfig", "value": {"model": "gpt-x"}}
             marker_cat = build_cat(settings={})
-            m1 = asyncio.run(
-                cat_alog.ingestion_phase_settings_marker("catalog_cards", marker_cat)
-            )
-            cache_changed = build_cat(settings={
-                "cache_ttl_seconds": 1, "cache_max_size": 1,
-            })
-            m2 = asyncio.run(
-                cat_alog.ingestion_phase_settings_marker("catalog_cards", cache_changed)
-            )
-            assert m1 == m2, "(p) cache tuning must not change the marker"
+            m1 = asyncio.run(cat_alog.CatalogCardsPhase().settings(marker_cat))
+            unrelated = build_cat(settings={"append_file_list_to_prompt": False})
+            m2 = asyncio.run(cat_alog.CatalogCardsPhase().settings(unrelated))
+            assert m1 == m2, "(p) unrelated tuning must not change the settings"
             words_changed = build_cat(settings={"max_summary_words": 201})
-            m3 = asyncio.run(
-                cat_alog.ingestion_phase_settings_marker("catalog_cards", words_changed)
-            )
-            assert m3 != m1, "(p) max_summary_words must change the marker"
+            m3 = asyncio.run(cat_alog.CatalogCardsPhase().settings(words_changed))
+            assert m3 != m1, "(p) max_summary_words must change the settings"
             LLM_SETTINGS["agent"] = {"name": "LLMConfig", "value": {"model": "gpt-y"}}
-            m4 = asyncio.run(
-                cat_alog.ingestion_phase_settings_marker("catalog_cards", marker_cat)
+            m4 = asyncio.run(cat_alog.CatalogCardsPhase().settings(marker_cat))
+            assert m4 != m1, "(p) agent LLM change must change the settings"
+            assert m1["prompt"] == cat_alog._SUMMARY_PROMPT_TEMPLATE, (
+                "(p) the summary prompt must be part of the material settings"
             )
-            assert m4 != m1, "(p) agent LLM change must change the marker"
-            assert asyncio.run(
-                cat_alog.ingestion_phase_settings_marker("other_phase", marker_cat)
-            ) is None, "(p) unknown phases must yield a conservative None marker"
         finally:
             cat_alog._run_summary_agent = original_summary
             cat_alog._resolve_embedder = original_embedder
 
-        # ── (q) Truth table: EffING importable × SYSTEM engine -> gate ─────────
-        # Restored after 0a8633f deleted them. `_phase_machine_active` imports
-        # `cat.core_plugins.cat_efficient_ingestion.phases` lazily and resolves the
-        # SYSTEM ingestion engine; both are stubbed, so the three rows are pure.
-        phases_mod = types.ModuleType(_EFFING_PHASES_KEY)
-        import cat.core_plugins.cat_efficient_ingestion as cat_core_phases_parent
-        gate_cat = SimpleNamespace()
+        # ── (q) Registration: ONE hook, phase CLASS, no mutation, no instance ───
+        gate_cat = build_cat(with_file=True)
 
-        # (q1) EffING absent -> classic, regardless of the engine setting.
-        RESOLVED_INGESTION["name"] = "EfficientIngestionConfiguration"
-        sys.modules.pop(_EFFING_PHASES_KEY, None)
-        assert asyncio.run(cat_alog._phase_machine_active(gate_cat)) is False, (
-            "(q1) absent EffING must keep the classic path"
+        # (q1) the hook appends the class (the host instantiates it per run).
+        registered = cat_alog.rabbithole_ingestion_phases([], gate_cat)
+        assert registered == [cat_alog.CatalogCardsPhase], (
+            "(q1) the hook must append the CatalogCardsPhase class"
         )
 
-        # (q2) EffING present + CORE engine -> classic.
-        sys.modules[_EFFING_PHASES_KEY] = phases_mod
-        cat_core_phases_parent.phases = phases_mod
-        RESOLVED_INGESTION["name"] = "CoreIngestionConfiguration"
-        assert asyncio.run(cat_alog._phase_machine_active(gate_cat)) is False, (
-            "(q2) core engine must keep the classic path"
-        )
+        # (q2) the contribution is a core-protocol phase subclass.
+        assert isinstance(registered[0], type) and issubclass(
+            registered[0], cat_alog.IngestionPhase
+        ), "(q2) the registered entry must be an IngestionPhase subclass"
 
-        # (q3) EffING present + EFFICIENT engine -> phase path active.
-        RESOLVED_INGESTION["name"] = "EfficientIngestionConfiguration"
-        assert asyncio.run(cat_alog._phase_machine_active(gate_cat)) is True, (
-            "(q3) efficient engine must activate the phase path"
+        # (q3) the hook returns a new list and never mutates the caller's one.
+        base_phases = []
+        out_q = cat_alog.rabbithole_ingestion_phases(base_phases, gate_cat)
+        assert out_q is not base_phases and base_phases == [], (
+            "(q3) the hook must not mutate the caller's phase list"
         )
-        # Back to the classic path for the id-scoping checks below.
-        sys.modules.pop(_EFFING_PHASES_KEY, None)
+        assert out_q == [cat_alog.CatalogCardsPhase], "(q3) exactly one phase is contributed"
 
         # ── (r) Tenant-scoped id: same source in two agents -> two distinct cards ─
-        def _classic_card(cat, source):
-            cat_alog.CATALOGUES.set(cat.agent_key, cat.id, source, "S")
-            out = asyncio.run(cat_alog.before_rabbithole_stores_documents(
-                [Document(page_content="chunk", metadata={"source": source})], cat,
-            ))
-            return [d for d in out if d.metadata.get("is_catalogue_card") is True][0]
-
         agent_a = build_cat(with_file=True)
         agent_a.agent_key = "agentA"
         agent_b = build_cat(with_file=True)
         agent_b.agent_key = "agentB"
-        card_a = _classic_card(agent_a, "same.pdf")
-        card_b = _classic_card(agent_b, "same.pdf")
-        assert card_a.id != card_b.id, "(r) same source in two agents must not collide"
-        assert card_a.id == cat_alog._catalogue_card_point_id("agentA", agent_a.id, "same.pdf")
-        assert card_b.id == cat_alog._catalogue_card_point_id("agentB", agent_b.id, "same.pdf")
+        card_a_id = cat_alog._catalogue_card_point_id("agentA", agent_a.id, "same.pdf")
+        card_b_id = cat_alog._catalogue_card_point_id("agentB", agent_b.id, "same.pdf")
+        assert card_a_id != card_b_id, "(r) same source in two agents must not collide"
+        assert card_a_id == cat_alog._catalogue_card_point_id("agentA", agent_a.id, "same.pdf")
+        assert card_b_id == cat_alog._catalogue_card_point_id("agentB", agent_b.id, "same.pdf")
 
         # ── (s) Chat-scoped id: same source in two chats of one agent -> two cards ─
         chat_1 = build_cat(with_file=True)
         chat_1.id = "chatA"
         chat_2 = build_cat(with_file=True)
         chat_2.id = "chatB"
-        card_c1 = _classic_card(chat_1, "same.pdf")
-        card_c2 = _classic_card(chat_2, "same.pdf")
-        assert card_c1.id != card_c2.id, "(s) same source in two chats must not collide"
+        card_c1_id = cat_alog._catalogue_card_point_id("agent", chat_1.id, "same.pdf")
+        card_c2_id = cat_alog._catalogue_card_point_id("agent", chat_2.id, "same.pdf")
+        assert card_c1_id != card_c2_id, "(s) same source in two chats must not collide"
 
         # ── (u) Phase failure -> status dict, never the phase id ─────────────
         class NotFoundError(Exception):
@@ -960,18 +954,18 @@ if __name__ == "__main__":
         cat_alog._resolve_embedder = _embedder_u
         cat_alog.log.error = lambda msg, *a, **k: logged_u.append(str(msg))
         try:
-            result_u = asyncio.run(
-                cat_alog.ingestion_phase_run("catalog_cards", "bad.pdf", {}, cat_u)
-            )
+            result_u = _run_phase("bad.pdf", cat_u)
         finally:
             cat_alog._run_summary_agent = original_summary_u
             cat_alog._resolve_embedder = original_embedder_u
             cat_alog.log.error = original_log_error_u
 
-        assert isinstance(result_u, dict), "(u) failure must return a status dict"
-        assert result_u.get("status") == "error", "(u) permanent failure must be error"
-        assert result_u.get("reason"), "(u) error status must carry a reason"
-        assert "NotFoundError" in result_u["reason"], "(u) reason must name the exception"
+        assert isinstance(result_u, cat_alog.PhaseResult), (
+            "(u) failure must return a core PhaseResult"
+        )
+        assert result_u.status == "error", "(u) permanent failure must be error"
+        assert result_u.reason, "(u) error status must carry a reason"
+        assert "NotFoundError" in result_u.reason, "(u) reason must name the exception"
         assert result_u != "catalog_cards", "(u) phase id leaked as the result"
         assert logged_u, "(u) phase failure was not logged"
         assert "catalog_cards" in logged_u[0], "(u) log line must carry the phase id"
@@ -1004,14 +998,12 @@ if __name__ == "__main__":
             # (w-a) Ran with chunks, produced 0 cards -> done + warning, no error.
             handler_wa = FakePhaseHandler({DEC: [_chunk("empty.pdf")]})
             cat_wa = FakeCat(FakeFileManager([]), handler_wa, {})
-            result_wa = asyncio.run(
-                cat_alog.ingestion_phase_run("catalog_cards", "empty.pdf", {}, cat_wa)
-            )
-            assert result_wa.get("status") == "done", (
+            result_wa = _run_phase("empty.pdf", cat_wa)
+            assert result_wa.status == "done", (
                 "(w-a) an empty extraction must be done, not error/not_ready"
             )
-            assert "reason" not in result_wa, "(w-a) a warning result must not carry a reason"
-            warnings_wa = result_wa.get("warnings")
+            assert result_wa.reason is None, "(w-a) a warning result must not carry a reason"
+            warnings_wa = result_wa.warnings
             assert isinstance(warnings_wa, list) and len(warnings_wa) == 1, (
                 "(w-a) exactly one warning must be attached", warnings_wa
             )
@@ -1019,13 +1011,15 @@ if __name__ == "__main__":
             assert warning_wa.get("code") == "empty-extraction", warning_wa
             assert "'empty.pdf'" in warning_wa.get("message", ""), warning_wa
             assert "1 chunk(s)" in warning_wa.get("message", ""), warning_wa
-            assert result_wa.get("processed") == 0, (
+            assert result_wa.processed == 0, (
                 "(w-a) processed must report the 0 cards produced"
             )
 
             # The phase object carries the same warning on its result.
-            phase_wa = cat_alog.CatalogCardsPhase(cat_wa)
-            result_wa_obj = asyncio.run(phase_wa.process("empty.pdf", cat_wa))
+            phase_wa = cat_alog.CatalogCardsPhase()
+            result_wa_obj = asyncio.run(
+                phase_wa.process(_source("empty.pdf", cat_wa), cat_wa)
+            )
             assert result_wa_obj.status == "done", "(w-a) phase object must be done"
             assert result_wa_obj.warnings == warnings_wa, (
                 "(w-a) the phase object must carry the warning"
@@ -1038,92 +1032,80 @@ if __name__ == "__main__":
             result_wb = asyncio.run(
                 cat_alog._run_catalog_cards_phase("missing.pdf", cat_wb)
             )
-            assert result_wb == {"status": "not_ready", "retry_after": 5}, (
+            assert result_wb.status == "not_ready" and result_wb.retry_after == 5, (
                 "(w-b) a source without chunks must stay not_ready", result_wb
             )
-            phase_wb = cat_alog.CatalogCardsPhase(cat_wb)
-            assert asyncio.run(phase_wb.process("missing.pdf", cat_wb)).status == (
-                "not_ready"
-            ), "(w-b) the phase object must stay not_ready without chunks"
+            phase_wb = cat_alog.CatalogCardsPhase()
+            assert asyncio.run(
+                phase_wb.process(_source("missing.pdf", cat_wb), cat_wb)
+            ).status == "not_ready", (
+                "(w-b) the phase object must stay not_ready without chunks"
+            )
 
             # (w-c) LLM failure -> still the current error path, no warning.
             handler_wc = FakePhaseHandler({DEC: [_chunk("bad.pdf")]})
             cat_wc = FakeCat(FakeFileManager([]), handler_wc, {})
             cat_alog._run_summary_agent = _raise_not_found
             cat_alog._resolve_embedder = _embedder_u
-            result_wc = asyncio.run(
-                cat_alog.ingestion_phase_run("catalog_cards", "bad.pdf", {}, cat_wc)
-            )
-            assert result_wc.get("status") == "error", (
+            result_wc = _run_phase("bad.pdf", cat_wc)
+            assert result_wc.status == "error", (
                 "(w-c) an LLM failure must stay an error", result_wc
             )
-            assert "NotFoundError" in result_wc.get("reason", ""), result_wc
-            assert "warnings" not in result_wc, "(w-c) an error must carry no warning"
+            assert "NotFoundError" in (result_wc.reason or ""), result_wc
+            assert not result_wc.warnings, "(w-c) an error must carry no warning"
             assert not handler_wc.added, "(w-c) a failed phase must not write a card"
 
             # (w-d) done + warnings is COMPLETE: no retry signal is produced, so
             # the machine does not retry and dependents are not blocked.
             cat_alog._run_summary_agent = _fake_summary_agent
             cat_alog._resolve_embedder = _zero_embedder
-            result_wd = asyncio.run(phase_wa.process("empty.pdf", cat_wa))
+            result_wd = asyncio.run(
+                phase_wa.process(_source("empty.pdf", cat_wa), cat_wa)
+            )
             assert result_wd.status == "done", (
                 "(w-d) done is the completion signal for a warned phase"
             )
-            status_wd = cat_alog._phase_result_as_status(result_wd)
-            assert status_wd["status"] == "done", status_wd
-            assert status_wd.get("warnings") == warnings_wa, status_wd
-            assert "retry_after" not in status_wd, (
-                "(w-d) a warned phase must not request a retry", status_wd
+            assert result_wd.warnings == warnings_wa, result_wd
+            assert result_wd.retry_after is None, (
+                "(w-d) a warned phase must not request a retry", result_wd
             )
-            assert "reason" not in status_wd, status_wd
+            assert result_wd.reason is None, result_wd
         finally:
             cat_alog._run_summary_agent = original_summary_w
             cat_alog._resolve_embedder = original_embedder_w
 
         # ── Phase ABC migration tests ──────────────────────────────────────────
         assert cat_alog.CatalogCardsPhase is not None, (
-            "CatalogCardsPhase must be defined when EffING's ABC is importable"
+            "CatalogCardsPhase must be defined"
         )
-        assert issubclass(cat_alog.CatalogCardsPhase, cat_alog._IngestionPhase), (
-            "CatalogCardsPhase must subclass the canonical IngestionPhase"
+        assert issubclass(cat_alog.CatalogCardsPhase, cat_alog.IngestionPhase), (
+            "CatalogCardsPhase must subclass the core IngestionPhase"
         )
 
         # (abc-a) applies_to is a CAPABILITY check only: the catalogue has no
-        # per-agent enable flag, so the phase always applies. The engine gate
-        # (EffING installed AND efficient engine) is EffING's decision, never
+        # per-agent enable flag, so the phase always applies — no engine gate is
         # re-derived inside the phase class.
         catalogue_off = build_cat(with_file=True)
-        phase_a = cat_alog.CatalogCardsPhase(catalogue_off)
-        original_gate_a = cat_alog._phase_machine_active
-
-        async def _gate_off(cat=None):
-            return False
-
-        async def _gate_on(cat=None):
-            return True
-
-        cat_alog._phase_machine_active = _gate_off
-        try:
-            applies_off, reason_off = asyncio.run(
-                phase_a.applies_to(catalogue_off, {})
-            )
-        finally:
-            cat_alog._phase_machine_active = original_gate_a
-        assert applies_off is True and reason_off is None, (
-            "(abc-a) applies_to must not re-implement the engine gate"
+        phase_a = cat_alog.CatalogCardsPhase()
+        applies_off, reason_off = asyncio.run(
+            phase_a.applies_to(_source("anything.pdf", catalogue_off), catalogue_off)
         )
-        cat_alog._phase_machine_active = _gate_on
-        try:
-            applies_on, reason_on = asyncio.run(phase_a.applies_to(catalogue_off, {}))
-        finally:
-            cat_alog._phase_machine_active = original_gate_a
+        assert applies_off is True and reason_off is None, (
+            "(abc-a) applies_to must be a capability check with no reason"
+        )
+        catalogue_on = build_cat(
+            with_file=True, settings={"append_file_list_to_prompt": True}
+        )
+        applies_on, reason_on = asyncio.run(
+            phase_a.applies_to(_source("anything.pdf", catalogue_on), catalogue_on)
+        )
         assert applies_on is True and reason_on is None, (
             "(abc-a) the catalogue capability applies without a reason"
         )
-        registered = cat_alog.ingestion_phase_objects(cat=catalogue_off)
-        assert len(registered) == 1 and isinstance(
-            registered[0], cat_alog.CatalogCardsPhase
-        ), "(abc-a) the phase must be registered through ingestion_phase_objects"
+        registered = cat_alog.rabbithole_ingestion_phases([], catalogue_off)
+        assert registered == [cat_alog.CatalogCardsPhase], (
+            "(abc-a) the phase must be registered through rabbithole_ingestion_phases"
+        )
 
         # (abc-a2) The phase class must NOT own the ingestion protocol: no diary,
         # staleness, lock, retry or status-derivation helper may be referenced.
@@ -1189,8 +1171,8 @@ if __name__ == "__main__":
             ],
         })
         cat_b = FakeCat(FakeFileManager([]), handler_b, {})
-        phase_b = cat_alog.CatalogCardsPhase(cat_b)
-        asyncio.run(phase_b.delete("del.pdf", cat_b))
+        phase_b = cat_alog.CatalogCardsPhase()
+        asyncio.run(phase_b.delete(_source("del.pdf", cat_b), cat_b))
         remaining_dec = [r.id for r in handler_b.by_collection.get(DEC, [])]
         remaining_eps = [r.id for r in handler_b.by_collection.get(EPS, [])]
         assert del_dec_id not in remaining_dec and del_eps_id not in remaining_eps, (
@@ -1203,52 +1185,50 @@ if __name__ == "__main__":
             "(abc-b) delete must not touch another source's cards"
         )
         deletes_after_first = len(handler_b.deleted)
-        asyncio.run(phase_b.delete("del.pdf", cat_b))
+        asyncio.run(phase_b.delete(_source("del.pdf", cat_b), cat_b))
         assert len(handler_b.deleted) == deletes_after_first, (
             "(abc-b) a second delete must be a no-op (idempotent)"
         )
-        asyncio.run(phase_b.delete("never-existed.pdf", cat_b))
+        asyncio.run(phase_b.delete(_source("never-existed.pdf", cat_b), cat_b))
         assert len(handler_b.deleted) == deletes_after_first, (
             "(abc-b) delete of an absent source must be safe and write nothing"
         )
 
-        # (abc-c) tag() is stable, changes with the config, ignores cache tuning.
+        # (abc-c) settings() is stable, changes with the config, ignores unrelated tuning.
         LLM_SETTINGS["agent"] = {"name": "LLMConfig", "value": {"model": "gpt-x"}}
         tag_base = build_cat(settings={"max_summary_words": 200})
-        tag_phase = cat_alog.CatalogCardsPhase(tag_base)
-        t1 = asyncio.run(tag_phase.tag())
-        t2 = asyncio.run(tag_phase.tag())
-        assert t1 == t2, "(abc-c) an unchanged configuration must keep the same tag"
-        tag_cache = cat_alog.CatalogCardsPhase(
-            build_cat(settings={"max_summary_words": 200, "cache_ttl_seconds": 1})
-        )
-        assert asyncio.run(tag_cache.tag()) == t1, (
-            "(abc-c) cache tuning must not change the tag"
-        )
-        tag_words = cat_alog.CatalogCardsPhase(
-            build_cat(settings={"max_summary_words": 201})
-        )
-        assert asyncio.run(tag_words.tag()) != t1, (
-            "(abc-c) a catalogue config change must change the tag"
-        )
+        tag_phase = cat_alog.CatalogCardsPhase()
+        t1 = asyncio.run(tag_phase.settings(tag_base))
+        t2 = asyncio.run(tag_phase.settings(tag_base))
+        assert t1 == t2, "(abc-c) an unchanged configuration must keep the same settings"
+        tag_cache = cat_alog.CatalogCardsPhase()
+        assert asyncio.run(tag_cache.settings(build_cat(settings={
+            "max_summary_words": 200, "append_file_list_to_prompt": False,
+        }))) == t1, "(abc-c) the prompt-list switch must not change the settings"
+        tag_words = cat_alog.CatalogCardsPhase()
+        assert asyncio.run(tag_words.settings(build_cat(settings={
+            "max_summary_words": 201,
+        }))) != t1, "(abc-c) a catalogue config change must change the settings"
 
         # (abc-d) process() delegates to the existing card-generation path.
         delegate_calls = []
 
         async def _fake_cards_path(source, cat):
             delegate_calls.append((source, cat))
-            return {"status": "done"}
+            return cat_alog.PhaseResult(status="done")
 
         original_cards_path = cat_alog._run_catalog_cards_phase
         cat_alog._run_catalog_cards_phase = _fake_cards_path
         try:
-            result_d = asyncio.run(phase_b.process("delegate.pdf", cat_b))
+            result_d = asyncio.run(
+                phase_b.process(_source("delegate.pdf", cat_b), cat_b)
+            )
         finally:
             cat_alog._run_catalog_cards_phase = original_cards_path
         assert delegate_calls == [("delegate.pdf", cat_b)], (
             "(abc-d) process must delegate to _run_catalog_cards_phase"
         )
-        assert result_d.status == "done", "(abc-d) a done status must map to done"
+        assert result_d.status == "done", "(abc-d) a done result must stay done"
 
         # (v) GraphRAG-shaped payload: a REAL source chunk that carries stale
         # catalogue-card metadata (is_catalogue_card/full_card/is_catalogue_card_
@@ -1338,10 +1318,8 @@ if __name__ == "__main__":
 
         cat_alog._run_summary_agent = _short_summary_v
         cat_alog._resolve_embedder = _fake_resolve_embedder
-        result_v = asyncio.run(
-            cat_alog.ingestion_phase_run("catalog_cards", "graph.pdf", {}, cat_v)
-        )
-        assert result_v == {"status": "done"}, (
+        result_v = _run_phase("graph.pdf", cat_v)
+        assert result_v.status == "done", (
             "(v) the phase must complete instead of returning not_ready"
         )
         surviving_ids_v = [r.id for r in handler_v.by_collection.get(DEC, [])]
@@ -1549,9 +1527,7 @@ if __name__ == "__main__":
                 handler_pdf,
                 {},
             )
-            assert asyncio.run(
-                cat_alog._run_catalog_cards_phase("doc.pdf", cat_pdf)
-            ) == {"status": "done"}, "(a) PDF card phase must complete"
+            assert asyncio.run(cat_alog._run_catalog_cards_phase("doc.pdf", cat_pdf)).status == "done", "(a) PDF card phase must complete"
             _, card_points_pdf = handler_pdf.added[-1]
             card_pdf = card_points_pdf[0].payload["page_content"]
             initial_pdf = card_pdf.split("## Initial page\n\n", 1)[1].split(
@@ -1594,9 +1570,7 @@ if __name__ == "__main__":
                 handler_md,
                 {},
             )
-            assert asyncio.run(
-                cat_alog._run_catalog_cards_phase("notes.md", cat_md)
-            ) == {"status": "done"}, "(b) markdown card phase must complete"
+            assert asyncio.run(cat_alog._run_catalog_cards_phase("notes.md", cat_md)).status == "done", "(b) markdown card phase must complete"
             _, card_points_md = handler_md.added[-1]
             card_md = card_points_md[0].payload["page_content"]
             initial_md = card_md.split("## Initial page\n\n", 1)[1].split(
@@ -1630,9 +1604,7 @@ if __name__ == "__main__":
             )
             handler_leak = FakePhaseHandler({DEC: [chunk_leak], EPS: []})
             cat_leak = FakeCat(FakeFileManager([]), handler_leak, {})
-            assert asyncio.run(
-                cat_alog._run_catalog_cards_phase("leak.pdf", cat_leak)
-            ) == {"status": "done"}, "(c) leak card phase must complete"
+            assert asyncio.run(cat_alog._run_catalog_cards_phase("leak.pdf", cat_leak)).status == "done", "(c) leak card phase must complete"
             meta_after_leak = chunk_leak.payload["metadata"]
             for card_key in (
                 "is_catalogue_card", "is_catalogue_card_segment", "full_card",
@@ -1665,9 +1637,7 @@ if __name__ == "__main__":
             )
             handler_plain = FakePhaseHandler({DEC: [chunk_plain], EPS: []})
             cat_plain = FakeCat(FakeFileManager([]), handler_plain, {})
-            assert asyncio.run(
-                cat_alog._run_catalog_cards_phase("plain.pdf", cat_plain)
-            ) == {"status": "done"}, "(c) plain card phase must complete"
+            assert asyncio.run(cat_alog._run_catalog_cards_phase("plain.pdf", cat_plain)).status == "done", "(c) plain card phase must complete"
             assert chunk_plain.payload["metadata"] == plain_meta, (
                 "(c) a plain chunk must keep its metadata untouched"
             )
@@ -1677,7 +1647,6 @@ if __name__ == "__main__":
             # catalogue card must never enter either.
             captured_prompts.clear()
             mixed_source = "mixed.pdf"
-            cat_alog.CATALOGUES.delete("agent", "chat", mixed_source)
             text_body = "REAL TEXT BODY about the motor and the mission."
             text_chunk = SimpleNamespace(payload={
                 "page_content": text_body,
@@ -1723,9 +1692,7 @@ if __name__ == "__main__":
                 EPS: [],
             })
             cat_mixed = FakeCat(FakeFileManager([]), handler_mixed, {})
-            assert asyncio.run(
-                cat_alog._run_catalog_cards_phase(mixed_source, cat_mixed)
-            ) == {"status": "done"}, "(y) mixed phase must complete"
+            assert asyncio.run(cat_alog._run_catalog_cards_phase(mixed_source, cat_mixed)).status == "done", "(y) mixed phase must complete"
             assert len(captured_prompts) == 1, captured_prompts
             mixed_prompt = captured_prompts[0]
             assert text_body in mixed_prompt, "(y) the text chunk must be summarized"
@@ -1745,76 +1712,28 @@ if __name__ == "__main__":
                 "(y) the initial page must be the parsed text chunk only"
             )
 
-            # ── (z) LEGACY HOOKS: same rule for the split-stage summary prompt and
-            # the stored card's initial page. ``docs[0]`` is an image on purpose:
-            # metadata must come from the first real TEXT document.
-            captured_prompts.clear()
-            legacy_source = "legacy-mixed.pdf"
-            cat_alog.CATALOGUES.delete("agent", "chat", legacy_source)
-            legacy_text = SimpleNamespace(
-                page_content="LEGACY REAL TEXT BODY.",
-                metadata={"source": legacy_source, "chunk_index": 3},
-            )
-            legacy_image = SimpleNamespace(
-                page_content=f"[Image] {legacy_source}",
-                metadata={
-                    "source": legacy_source,
-                    "image": True,
-                    "image_file": "legacy_img.png",
-                },
-            )
-            legacy_card = SimpleNamespace(
-                page_content="# CATALOGUE CARD\n## Initial page\nLEGACY CARD BODY",
-                metadata={
-                    "source": legacy_source,
-                    "is_catalogue_card": True,
-                    "full_card": "LEGACY CARD BODY",
-                },
-            )
-            legacy_binary = SimpleNamespace(
-                page_content="%PDF-1.5\n\x00 binary legacy bytes",
-                metadata={"source": legacy_source},
-            )
-            legacy_docs = [legacy_image, legacy_card, legacy_binary, legacy_text]
-            cat_legacy = FakeCat(FakeFileManager([]), FakePhaseHandler({DEC: [], EPS: []}), {})
-
-            original_gate_z = cat_alog._phase_machine_active
-
-            async def _gate_off_z(cat=None):
-                return False
-
-            cat_alog._phase_machine_active = _gate_off_z
-            try:
-                asyncio.run(
-                    cat_alog.before_rabbithole_splits_documents(legacy_docs, cat_legacy)
+            # ── (z) LEGACY SURFACE: the two classic ingestion hooks, the EffING
+            # phase hooks and their gate are GONE; only the core protocol hook
+            # registers the phase. The module must not import EffING.
+            for legacy_name in (
+                "before_rabbithole_splits_documents",
+                "before_rabbithole_stores_documents",
+                "ingestion_phase_" + "objects",
+                "ingestion_phase_" + "specs",
+                "ingestion_phase_" + "settings_marker",
+                "ingestion_phase_" + "run",
+                "ingestion_phase_" + "purge",
+                "_phase_machine_active",
+            ):
+                assert not hasattr(cat_alog, legacy_name), (
+                    f"(z) the legacy ingestion surface {legacy_name!r} must be removed"
                 )
-                assert len(captured_prompts) == 1, captured_prompts
-                legacy_prompt = captured_prompts[0]
-                assert "LEGACY REAL TEXT BODY." in legacy_prompt, (
-                    "(z) the text chunk must be summarized"
-                )
-                assert "[Image]" not in legacy_prompt, "(z) image doc leaked into prompt"
-                assert "LEGACY CARD BODY" not in legacy_prompt, (
-                    "(z) card doc leaked into prompt"
-                )
-                assert "%PDF" not in legacy_prompt, "(z) binary doc leaked into prompt"
-
-                stored = asyncio.run(
-                    cat_alog.before_rabbithole_stores_documents(legacy_docs, cat_legacy)
-                )
-            finally:
-                cat_alog._phase_machine_active = original_gate_z
-
-            legacy_card_doc = stored[-1]
-            legacy_card_text = legacy_card_doc.page_content
-            legacy_initial = legacy_card_text.split("## Initial page\n\n", 1)[1].split(
-                "\n\n## Summary", 1
-            )[0]
-            assert legacy_initial.strip() == "LEGACY REAL TEXT BODY.", (
-                "(z) the stored card's initial page must be the text chunk only"
+            assert hasattr(cat_alog, "rabbithole_ingestion_phases"), (
+                "(z) the core registration hook must exist"
             )
-            assert legacy_card_doc.metadata.get("image") is not True, (
-                "(z) the card must not inherit image metadata from docs[0]"
+            module_source = _inspect.getsource(cat_alog)
+            assert "cat_efficient_ingestion" not in module_source, (
+                "(z) the plugin must not import the efficient-ingestion plugin"
             )
         finally:
             cat_alog._run_summary_agent = original_summary_x
@@ -1911,10 +1830,8 @@ if __name__ == "__main__":
                 }
 
             def _run_y():
-                result = asyncio.run(
-                    cat_alog.ingestion_phase_run("catalog_cards", "dash.txt", {}, cat_y)
-                )
-                assert result == {"status": "done"}, "(y) phase did not finish"
+                result = _run_phase("dash.txt", cat_y)
+                assert result.status == "done", "(y) phase did not finish"
 
             _run_y()
             first_dec = _ids_y(DEC, None)
@@ -1994,4 +1911,4 @@ if __name__ == "__main__":
         print("test_catalog_phase: ALL ASSERTIONS PASSED")
 
     finally:
-        effing_testkit.uninstall_stub_package()
+        pass

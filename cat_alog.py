@@ -1,15 +1,14 @@
 import asyncio
-import hashlib
 import mimetypes
 import os
-import threading
-import time
 import uuid
-from collections import OrderedDict
 from typing import Any, List, Tuple, Optional, Dict
 from datetime import datetime
 from pydantic import BaseModel, Field
 from cat import hook, plugin, tool, log, AgenticWorkflowTask
+from cat.rabbit_hole.chunks import read_source_bytes
+from cat.rabbit_hole.phases import IngestionPhase, IngestionSource, PhaseResult
+from cat.rabbit_hole.split import split_oversized
 from cat.services.memory.models import VectorMemoryType, PointStruct
 from langchain_core.documents.base import Document
 
@@ -22,14 +21,6 @@ class CatAlogSettings(BaseModel):
     max_summary_words: int = Field(
         default=200,
         description="Maximum number of words for the summary."
-    )
-    cache_ttl_seconds: int = Field(
-        default=3600,
-        description="Time-to-live for cache entries in seconds."
-    )
-    cache_max_size: int = Field(
-        default=100,
-        description="Maximum number of entries in the LRU cache."
     )
     append_file_list_to_prompt: bool = Field(
         default=True,
@@ -45,52 +36,8 @@ def settings_model():
     return CatAlogSettings
 
 
-class TTL_LRU_Cache:
-    def __init__(self, max_size: int = 100, ttl_seconds: int = 3600):
-        self._cache: OrderedDict[Tuple[str, Optional[str], str], Tuple[str, float]] = OrderedDict()
-        self._max_size = max_size
-        self._ttl_seconds = ttl_seconds
-        self._lock = threading.Lock()
-
-    def _make_key(self, agent_id: str, chat_id: Optional[str], filename: str) -> Tuple[str, Optional[str], str]:
-        return (agent_id, chat_id, filename)
-
-    def get(self, agent_id: str, chat_id: Optional[str], filename: str) -> Optional[str]:
-        key = self._make_key(agent_id, chat_id, filename)
-        with self._lock:
-            if key not in self._cache:
-                return None
-            value, timestamp = self._cache[key]
-            if time.time() - timestamp > self._ttl_seconds:
-                del self._cache[key]
-                return None
-            self._cache.move_to_end(key)
-            return value
-        return None
-
-    def set(self, agent_id: str, chat_id: Optional[str], filename: str, summary: str) -> None:
-        key = self._make_key(agent_id, chat_id, filename)
-        with self._lock:
-            if key in self._cache:
-                self._cache.move_to_end(key)
-            self._cache[key] = (summary, time.time())
-            while len(self._cache) > self._max_size:
-                self._cache.popitem(last=False)
-
-    def delete(self, agent_id: str, chat_id: Optional[str], filename: str) -> bool:
-        key = self._make_key(agent_id, chat_id, filename)
-        with self._lock:
-            if key in self._cache:
-                del self._cache[key]
-                return True
-            return False
-
-
-CATALOGUES = TTL_LRU_Cache()
-
-#: Prompt template for the catalogue-card summary. Kept as a module constant
-#: so the settings marker (ingestion_phase_settings_marker) can fingerprint it:
-#: a change to the prompt invalidates previously generated cards.
+#: Prompt template for the catalogue-card summary. Part of the phase
+#: settings: a change to the prompt invalidates previously generated cards.
 _SUMMARY_PROMPT_TEMPLATE = """Write a short summary of the following file.
 Focus on what the file is, what it is about, and what it contains.
 Maximum {max_summary_words} words.
@@ -103,93 +50,8 @@ Maximum {max_summary_words} words.
 """
 
 
-_EFFICIENT_INGESTION_CONFIG_NAME = "EfficientIngestionConfiguration"
-
-# EffING is optional: the classic CAT ingestion path must keep working when its
-# phase module is absent. The class API is imported from the CANONICAL path
-# (the host loads ``cat/core_plugins/`` and derives the module name from the
-# folder, so any other path would be a second module identity).
-try:
-    from cat.core_plugins.cat_efficient_ingestion.phases import (
-        IngestionPhase as _IngestionPhase,
-        PhaseResult as _PhaseResult,
-    )
-except Exception:  # noqa: BLE001 - optional dependency, never break the import
-    _IngestionPhase = None
-    _PhaseResult = None
-
-
-async def _resolved_system_ingestion_config_name(cat) -> "Optional[str]":
-    """Effective SYSTEM-level ingestion engine name.
-
-    The ``ingestion`` category is one of the two system-level services (the
-    other is ``embedder``), so its selection is read against
-    ``DEFAULT_SYSTEM_KEY`` — never the agent key. ``resolved_config_name`` is
-    the canonical resolver (signature: ``resolved_config_name(lizard) -> str``);
-    a host that predates it is handled by reading the same single system-level
-    category entry directly, so both paths return the same value.
-    """
-    try:
-        from cat.services.factory.ingestion import resolved_config_name
-    except ImportError:
-        resolved_config_name = None
-
-    if resolved_config_name is not None:
-        return await resolved_config_name(cat)
-
-    from cat.db.cruds import settings as crud_settings
-    from cat.db.database import DEFAULT_SYSTEM_KEY
-
-    saved = await crud_settings.get_settings_by_category(
-        DEFAULT_SYSTEM_KEY, "ingestion"
-    )
-    return (saved or {}).get("name")
-
-
-async def _phase_machine_active(cat=None) -> bool:
-    """Whether the EffING phase path owns card generation for this ingest.
-
-    Single source of truth for the two ingestion modes (same contract as
-    GraphRAG's phase path). The phase path is active **iff**:
-
-    ==========================  ======================  =============
-    EffING installed/loadable   SYSTEM ``ingestion``    phase path
-    ==========================  ======================  =============
-    no                          any                     inactive
-    yes                         core engine             inactive
-    yes                         efficient engine        active
-    ==========================  ======================  =============
-
-    ``yes`` means the phases module is importable from the CANONICAL path
-    ``cat.core_plugins.cat_efficient_ingestion.phases``. When the phase path is
-    active the ``catalog_cards`` phase owns card generation and persistence, so
-    the two ``before_rabbithole_*`` hooks are no-ops; in every other case the
-    classic hooks run (TTL cache + card append) and the phase registrations are
-    simply inert, so the two mechanisms can never run together and neither is
-    dead. Import-safe (no side effects).
-    """
-    try:
-        import cat.core_plugins.cat_efficient_ingestion.phases  # noqa: F401
-    except Exception:
-        return False
-
-    if cat is None:
-        return False
-
-    try:
-        name = await _resolved_system_ingestion_config_name(cat)
-    except Exception as exc:  # noqa: BLE001
-        log.warning(
-            f"cat_alog: could not resolve the system ingestion engine "
-            f"({exc!r}); using the legacy card hooks."
-        )
-        return False
-
-    return name == _EFFICIENT_INGESTION_CONFIG_NAME
-
-
 def _build_summary_prompt(source: str, full_text: str, max_summary_words: int) -> str:
-    """Build the LLM summary prompt for ``source`` (shared by hook and phase).
+    """Build the LLM summary prompt for ``source``.
 
     The file content is brace-escaped so it can be interpolated with
     ``str.format`` without breaking the template placeholders.
@@ -205,8 +67,8 @@ def _build_summary_prompt(source: str, full_text: str, max_summary_words: int) -
 async def _run_summary_agent(cat, prompt: str) -> str:
     """Run the LLM summary agent for ``prompt`` (no exception swallowing).
 
-    The legacy hook wraps this in try/except with a fallback; the
-    ``catalog_cards`` phase lets exceptions propagate (fail-hard -> ERROR).
+    A failure propagates: the ``catalog_cards`` phase turns it into an ERROR
+    result, so the source is not silently completed without its card.
     """
     agent_input = AgenticWorkflowTask(user_prompt=prompt)
     summary_agent_output = await cat.agentic_workflow.run(
@@ -217,7 +79,7 @@ async def _run_summary_agent(cat, prompt: str) -> str:
 
 
 def _build_catalogue_card(source: str, metadata: Dict, abstract: str, summary: str) -> Tuple[str, Dict]:
-    """Build the catalogue card text + metadata (shared by hook and phase).
+    """Build the catalogue card text + metadata.
 
     The seed metadata comes from the first stored chunk. It is stripped of any
     card-only keys first so the card can never inherit ``is_catalogue_card`` /
@@ -285,9 +147,6 @@ def _catalogue_card_point_id(
         f"catalogue_card:{agent_key}:{chat_id or ''}:{source}{suffix}",
     ).hex
 
-
-def _is_url_source(source: str) -> bool:
-    return str(source).startswith(("http://", "https://"))
 
 
 #: Source extensions whose RAW BYTES are readable text, so decoding them gives
@@ -402,65 +261,20 @@ def _metadata_is_image(meta: Dict) -> bool:
     )
 
 
-def _metadata_is_catalogue_card(meta: Dict) -> bool:
-    """Whether a point/document carries any catalogue-card marker/metadata."""
-    return bool(
-        meta.get("is_catalogue_card")
-        or meta.get("is_catalogue_card_segment")
-        or meta.get("full_card")
-    )
-
-
-def _is_llm_text_document(doc) -> bool:
-    """Whether a parsed document is source TEXT safe to send to an LLM."""
-    meta = getattr(doc, "metadata", None) or {}
-    content = getattr(doc, "page_content", "") or ""
-    if not content.strip():
-        return False
-    if _metadata_is_image(meta) or _metadata_is_catalogue_card(meta):
-        return False
-    return not _looks_binary_text(content)
-
-
 async def _read_source_bytes(cat, source: str, chat_id: "Optional[str]") -> "Optional[bytes]":
-    """Raw bytes of ``source`` as persisted on disk (file or URL copy).
+    """Raw bytes of ``source`` kept by the host file manager.
 
-    Files live under the agent root or the conversation root; URLs are
-    persisted by the efficient-ingestion plugin under the deterministic name
-    ``_persisted_url_file_name`` (same path: agent root / chat root). ``None``
-    when neither copy exists (the caller then falls back to the stored points).
+    The host stores the uploaded file and, for a URL, the bytes it downloaded
+    (``cat.rabbit_hole.chunks``). ``None`` when no copy exists: the caller then
+    falls back to the stored chunks.
     """
     file_manager = getattr(cat, "file_manager", None)
     if file_manager is None:
         return None
-    agent_id = cat.agent_key
-
-    if _is_url_source(source):
-        try:
-            from cat.core_plugins.cat_efficient_ingestion.reembed import (
-                _persisted_url_file_name,
-            )
-        except Exception:  # noqa: BLE001 - EffING absent/older: no persisted URL copy
-            return None
-        root = os.path.join(agent_id, str(chat_id)) if chat_id else agent_id
-        try:
-            persisted_name = _persisted_url_file_name(source, root)
-            return file_manager.read_file(persisted_name, root)
-        except Exception:  # noqa: BLE001
-            return None
-
-    # FILE: the chat copy (when chat-scoped) shadows the agent copy.
-    roots = [agent_id]
-    if chat_id:
-        roots.insert(0, os.path.join(agent_id, str(chat_id)))
-    for root in dict.fromkeys(roots):
-        try:
-            data = file_manager.read_file(source, root)
-        except Exception:  # noqa: BLE001
-            data = None
-        if data is not None:
-            return data
-    return None
+    try:
+        return read_source_bytes(file_manager, cat.agent_key, chat_id, source)
+    except Exception:  # noqa: BLE001 - no persisted copy is not an error
+        return None
 
 
 #: Metadata keys that belong to a catalogue card, not to a source chunk. A
@@ -621,12 +435,11 @@ async def _load_source_chunk_groups(handler, source: str, agent_key: str):
 
 
 def _segment_card(card: str, card_metadata: Dict, embedder) -> list:
-    """Split an oversized card exactly like the classic store path.
+    """Split an oversized card with the core token-budget splitter.
 
-    The classic path hands the card Document to the token-budget splitter, so
-    every stored segment carries the original metadata (``full_card``
-    included). Reuse that splitter; when it is unavailable (EffING absent) the
-    card is stored whole.
+    Every stored segment carries the original metadata (``full_card``
+    included). The budget is the active embedder's input window: a missing or
+    non-positive limit disables the split and the card is stored whole.
 
     Every produced segment is marked ``is_catalogue_card_segment`` with a stable
     ``start_index`` inside the normalized card text. The re-embed path SKIPS
@@ -635,12 +448,9 @@ def _segment_card(card: str, card_metadata: Dict, embedder) -> list:
     suffix); the offset also makes the id independent of enumeration order.
     """
     card_doc = Document(page_content=card, metadata=card_metadata)
-    try:
-        from cat.core_plugins.cat_efficient_ingestion.split import split_oversized
-    except Exception:  # noqa: BLE001 - no splitter: store the card whole
-        segments = [card_doc]
-    else:
-        segments = split_oversized([card_doc], embedder) or [card_doc]
+    max_tokens = getattr(embedder, "max_input_tokens", None) or 0
+    tokenizer = getattr(embedder, "_estimate_tokens", None)
+    segments = split_oversized([card_doc], max_tokens, tokenizer) or [card_doc]
 
     normalized = " ".join(card.split())
     cursor = 0
@@ -717,67 +527,6 @@ async def _agent_llm_identity(cat) -> str:
     return "default"
 
 
-@hook(priority=10)
-def ingestion_phase_specs(specs, cat) -> list:
-    """Accumulator registrant declaring the ``catalog_cards`` phase.
-
-    Appends ``PhaseSpec("catalog_cards", settings_category=None,
-    depends_on=("parsing_chunking", "embedding"))`` so EffING computes
-    staleness for the card phase: it re-runs when the parsing/embedding
-    upstreams re-ran or when the plugin-defined settings marker changed.
-    Lazy-imports ``PhaseSpec``: with EffING absent the specs are returned
-    unchanged (import-safe).
-    """
-    try:
-        from cat.core_plugins.cat_efficient_ingestion.phases import PhaseSpec
-    except Exception:
-        return specs
-    specs = specs or []
-    specs.append(
-        PhaseSpec(
-            "catalog_cards",
-            settings_category=None,
-            depends_on=("parsing_chunking", "embedding"),
-        )
-    )
-    return specs
-
-
-@hook(priority=10)
-async def ingestion_phase_settings_marker(phase, cat) -> Any:
-    """Material settings marker for the ``catalog_cards`` phase.
-
-    SHA-256 fingerprint of the agent LLM identity, ``max_document_chars``,
-    ``max_summary_words`` and the summary prompt template: any change that can
-    alter the produced card invalidates previously generated cards. The cache
-    tuning (``cache_ttl_seconds`` / ``cache_max_size``) is deliberately NOT
-    part of the marker — it does not change the output. ``None`` for unknown
-    phases (conservative stale).
-    """
-    if phase != "catalog_cards":
-        return None
-    return await _catalogue_settings_marker(cat)
-
-
-async def _catalogue_settings_marker(cat) -> str:
-    """Configuration-only material fingerprint for the catalogue cards phase.
-
-    Undecorated so both the hook and :class:`CatalogCardsPhase` can call it
-    (the ``@hook`` decorator replaces the module-level name with a ``CatHook``
-    object, which is not directly callable). No LLM call.
-    """
-    settings = await cat.plugin_manager.get_plugin().load_settings()
-    settings = settings or {}
-    config = (
-        int(settings.get("max_document_chars", 8000)),
-        int(settings.get("max_summary_words", 200)),
-    )
-    fingerprint_source = repr(
-        (await _agent_llm_identity(cat), config, _SUMMARY_PROMPT_TEMPLATE)
-    )
-    return hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()
-
-
 _TRANSIENT_ERROR_MARKERS = (
     "Timeout",
     "ConnectionError",
@@ -800,58 +549,12 @@ def _is_transient_phase_error(exc: BaseException) -> bool:
     return any(marker in name for marker in _TRANSIENT_ERROR_MARKERS)
 
 
-def _phase_failure_status(exc: BaseException) -> Dict[str, Any]:
-    """Map an exception to a status dict: transient -> not_ready, else error."""
+def _phase_failure_result(exc: BaseException) -> PhaseResult:
+    """Map an exception to a phase result: transient -> not_ready, else error."""
     reason = f"{type(exc).__name__}: {exc}".strip()[:500]
     if _is_transient_phase_error(exc):
-        return {"status": "not_ready", "retry_after": 5, "reason": reason}
-    return {"status": "error", "reason": reason}
-
-
-@hook(priority=10)
-async def ingestion_phase_run(phase, source, completed_phases, cat) -> Any:
-    """Run the ``catalog_cards`` phase for ``source`` (tri-state contract).
-
-    - ``{"status": "done"}``: the card was embedded and stored as a vector
-      point with ``is_catalogue_card: True`` + ``full_card`` metadata;
-    - ``{"status": "done", "warnings": [...], "processed": 0}``: the phase RAN
-      over the source's existing chunks but produced no card (a tiny or
-      structural document may legitimately yield none) — complete, not retried;
-    - ``{"status": "not_ready", "retry_after": 5}``: the source has no stored
-      points yet, or the failure is transient (timeout/connection) — retry
-      later;
-    - ``{"status": "error", "reason": "..."}``: permanent failure (e.g. a 404 /
-      model not found) — the machine marks the phase ERROR;
-    - ``None`` for phases this plugin does not implement (hook abstention: the
-      dispatcher keeps the value produced by the phase's real owner).
-    """
-    if phase != "catalog_cards" or CatalogCardsPhase is None:
-        return None
-    # Thin delegation: the phase class owns the work and its status mapping.
-    return _phase_result_as_status(
-        await CatalogCardsPhase(cat).process(source, cat)
-    )
-
-
-def _phase_result_as_status(result: Any) -> Any:
-    """Translate a class ``PhaseResult`` back to the legacy status-dict contract.
-
-    The legacy hook dispatcher (EffING ``_run_external_phase``) still expects a
-    status dict, so the thin hook adapts the class result at the boundary
-    instead of re-implementing the run logic. ``retry_after`` is not carried by
-    ``PhaseResult``; the engine's default (5s) matches the previous value.
-    """
-    if _PhaseResult is not None and isinstance(result, _PhaseResult):
-        status = {"status": result.status}
-        if result.reason is not None:
-            status["reason"] = result.reason
-        if getattr(result, "processed", None) is not None:
-            status["processed"] = result.processed
-        warnings = getattr(result, "warnings", None)
-        if warnings:
-            status["warnings"] = warnings
-        return status
-    return result
+        return PhaseResult(status="not_ready", retry_after=5, reason=reason)
+    return PhaseResult(status="error", reason=reason)
 
 
 async def _delete_source_catalogue_cards(cat, source: str) -> int:
@@ -888,25 +591,7 @@ async def _delete_source_catalogue_cards(cat, source: str) -> int:
     return removed
 
 
-@hook(priority=10)
-async def ingestion_phase_purge(phase, source, cat) -> Any:
-    """Purge the catalogue-card points of ``source`` (phase purge hook).
-
-    EffING calls this before re-running an abandoned (expired-lease)
-    ``catalog_cards`` phase. Deletes ONLY this source's catalogue-card points
-    across ALL segments and BOTH collections (declarative + episodic), scoped
-    by ``is_catalogue_card`` so the source's chunks, images, graph artifacts
-    and every other source are untouched. Returns a truthy status dict after
-    purging, and ``None`` for phases this plugin does not implement.
-    """
-    if phase != "catalog_cards" or CatalogCardsPhase is None:
-        return None
-    # Thin delegation: the phase class owns its source-scoped delete.
-    await CatalogCardsPhase(cat).delete(source, cat)
-    return {"status": "done"}
-
-
-async def _run_catalog_cards_phase(source, cat) -> Dict[str, Any]:
+async def _run_catalog_cards_phase(source: str, cat) -> PhaseResult:
     settings = await cat.plugin_manager.get_plugin().load_settings()
     settings = settings or {}
     max_document_chars = int(settings.get("max_document_chars", 8000))
@@ -920,7 +605,11 @@ async def _run_catalog_cards_phase(source, cat) -> Dict[str, Any]:
     # own card, in the SAME collection, with its own chat_id.
     groups = await _load_source_chunk_groups(handler, source, cat.agent_key)
     if not groups:
-        return {"status": "not_ready", "retry_after": 5}
+        return PhaseResult(
+            status="not_ready",
+            retry_after=5,
+            reason=f"no stored chunks for '{source}'",
+        )
 
     embedder = await _resolve_embedder(cat)
     total_chunks = 0
@@ -952,8 +641,8 @@ async def _run_catalog_cards_phase(source, cat) -> Dict[str, Any]:
         if len(full_text) > max_document_chars:
             full_text = full_text[:max_document_chars] + " [truncated] "
 
-        # Initial page. For a TEXTUAL source the raw persisted bytes (file on
-        # disk / EffING URL copy) are themselves readable text: keep the
+        # Initial page. For a TEXTUAL source the raw persisted bytes (uploaded
+        # file / host URL copy) are themselves readable text: keep the
         # historical raw-bytes preview, truncated to max_document_chars. For a
         # BINARY source (PDF/Office/image/archive) decoding those bytes yields
         # compressed-stream garbage (`%PDF-1.5 …`, replacement chars), so the
@@ -992,18 +681,17 @@ async def _run_catalog_cards_phase(source, cat) -> Dict[str, Any]:
 
         card, card_metadata = _build_catalogue_card(source, first_metadata, abstract, summary)
 
-        # Oversized cards are segmented exactly like the classic store path (the
-        # token-budget splitter copies the metadata, so ``full_card`` survives on
-        # every segment). Every segment is marked so a re-embed never re-splits it.
+        # Oversized cards are segmented with the core token-budget splitter (it
+        # copies the metadata, so ``full_card`` survives on every segment).
+        # Every segment is marked so a re-embed never re-splits it.
         segments = _segment_card(card, card_metadata, embedder)
         vectors = await asyncio.to_thread(
             embedder.embed_documents, [segment.page_content for segment in segments]
         )
-        # Deterministic ids: re-runs/engine switches upsert the same card instead
-        # of accumulating duplicates (add_points_to_tenant is an upsert). The id
-        # is carried in the PAYLOAD too so a re-embed rebuild (which reconstructs
-        # points from their payload) keeps the identity instead of minting a new
-        # uuid4 — see EffING ``reembed._embed_phase``.
+        # Deterministic ids: re-runs upsert the same card instead of accumulating
+        # duplicates (add_points_to_tenant is an upsert). The id is carried in
+        # the PAYLOAD too, so a re-embed rebuild (which reconstructs points from
+        # their payload) keeps the identity instead of minting a new uuid4.
         card_points = []
         for index, (segment, vector) in enumerate(zip(segments, vectors)):
             segment_start = segment.metadata.get("start_index")
@@ -1043,9 +731,9 @@ async def _run_catalog_cards_phase(source, cat) -> Dict[str, Any]:
     # complete, so it is not retried and no dependent is blocked. "Could not
     # run" (no chunks above, LLM failure) keeps its not_ready/error path.
     if produced == 0:
-        return {
-            "status": "done",
-            "warnings": [
+        return PhaseResult(
+            status="done",
+            warnings=[
                 {
                     "code": "empty-extraction",
                     "message": (
@@ -1054,239 +742,75 @@ async def _run_catalog_cards_phase(source, cat) -> Dict[str, Any]:
                     ),
                 }
             ],
-            "processed": 0,
-        }
-    return {"status": "done"}
-
-
-def _phase_result_from_status(phase_id: str, result: Any):
-    """Map the legacy status dict to EffING's ``PhaseResult`` (never silent)."""
-    if _PhaseResult is None:
-        raise RuntimeError("the EffING phase API is not available")
-    if isinstance(result, _PhaseResult):
-        return result
-    if isinstance(result, dict):
-        status = result.get("status")
-        if status not in ("done", "not_ready", "error", "skipped"):
-            return _PhaseResult(
-                status="error",
-                reason=f"phase '{phase_id}' returned invalid status {status!r}",
-            )
-        return _PhaseResult(
-            status=status,
-            reason=result.get("reason"),
-            processed=result.get("processed"),
-            warnings=result.get("warnings") or None,
+            processed=0,
         )
-    if result is None:
-        return _PhaseResult(
-            status="error", reason=f"phase '{phase_id}' has no run implementation"
-        )
-    return _PhaseResult(
-        status="error",
-        reason=f"phase '{phase_id}' returned {result!r} (expected a status dict)",
-    )
+    return PhaseResult(status="done")
 
 
-if _IngestionPhase is not None:
+class CatalogCardsPhase(IngestionPhase):
+    """The ``catalog_cards`` phase of the core ingestion protocol.
 
-    class CatalogCardsPhase(_IngestionPhase):
-        """The ``catalog_cards`` ingestion phase as an EffING phase object.
+    Runs after ``embedding``: it reads the source's stored chunks, summarizes
+    them and stores one catalogue card per (collection, chat). It owns only its
+    body and its source-scoped cleanup — the core owns the diary, staleness,
+    retries and locks.
+    """
 
-        Owns only the phase body (delegated to the SAME card-generation path
-        the legacy hook uses), a source-scoped ``delete`` and the configuration
-        fingerprint. No diary/state/lock/retry logic and no engine gate: the
-        phase protocol belongs to EffING. Registered through
-        ``ingestion_phase_objects``; the legacy hooks are thin delegations to
-        these methods.
+    id = "catalog_cards"
+    label = "Catalogue cards"
+    depends_on = ("embedding",)
+
+    async def settings(self, cat) -> Dict[str, Any]:
+        """The material configuration: when it changes, the card is regenerated.
+
+        The agent LLM identity, the size limits and the summary prompt can all
+        change the produced card, so they are part of the phase tag; the
+        prompt-list switch does not.
         """
+        settings = await cat.plugin_manager.get_plugin().load_settings()
+        settings = settings or {}
+        return {
+            "max_document_chars": int(settings.get("max_document_chars", 8000)),
+            "max_summary_words": int(settings.get("max_summary_words", 200)),
+            "llm": await _agent_llm_identity(cat),
+            "prompt": _SUMMARY_PROMPT_TEMPLATE,
+        }
 
-        id = "catalog_cards"
-        depends_on = ("parsing_chunking", "embedding")
-        settings_category = None
+    async def applies_to(self, source: IngestionSource, cat) -> Tuple[bool, Optional[str]]:
+        """Capability check only: the catalogue has no per-agent enable flag."""
+        return True, None
 
-        def __init__(self, cat=None):
-            super().__init__()
-            # Carries the cat that contributed this instance so ``tag`` (whose
-            # ABC signature receives only ``settings``) can read the config
-            # marker. Instances are created fresh by the registry on every
-            # probe, so this is not shared mutable state.
-            self._cat = cat
-
-        async def applies_to(self, cat, deps_state) -> Tuple[bool, Optional[str]]:
-            """Capability check only: is the catalogue enabled for this agent?
-
-            The catalogue has no per-agent enable flag (its plugin settings are
-            global tuning, not an on/off switch), and this phase object only
-            exists when EffING is importable. Whether the phase machinery is
-            actually active is the ENGINE's decision, computed and owned by
-            EffING — never re-derived here.
-            """
-            return True, None
-
-        async def process(self, source: str, cat):
-            """Delegate to the EXISTING card-generation path (no reimplementation)."""
-            used = cat if cat is not None else self._cat
-            try:
-                result = await _run_catalog_cards_phase(source, used)
-            except Exception as exc:  # noqa: BLE001 - failure is a status, never a raise
-                log.error(
-                    f"cat_alog: phase catalog_cards failed for '{source}': "
-                    f"{type(exc).__name__}: {exc}"
-                )
-                failure = _phase_failure_status(exc)
-                return _phase_result_from_status(self.id, failure)
-            return _phase_result_from_status(self.id, result)
-
-        async def delete(self, source: str, cat) -> None:
-            """Remove ONLY ``source``'s card points; idempotent and empty-safe."""
-            used = cat if cat is not None else self._cat
-            removed = await _delete_source_catalogue_cards(used, source)
-            log.info(
-                f"cat_alog: phase catalog_cards deleted {removed} "
-                f"catalogue-card segment(s) for '{source}'"
+    async def process(self, source: IngestionSource, cat) -> PhaseResult:
+        """Build and store the source's cards (same generator as before)."""
+        try:
+            return await _run_catalog_cards_phase(source.name, cat)
+        except Exception as exc:  # noqa: BLE001 - failure is a result, never a raise
+            log.error(
+                f"cat_alog: phase catalog_cards failed for '{source.name}': "
+                f"{type(exc).__name__}: {exc}"
             )
+            return _phase_failure_result(exc)
 
-        async def tag(self, settings: Any = None) -> str:
-            """Configuration-only invalidator: reuse the existing settings marker.
-
-            No LLM call. When the registry already resolved the marker it is
-            handed in as ``settings``; a direct call reads it from the cat.
-            """
-            if settings is None and self._cat is not None:
-                settings = await _catalogue_settings_marker(self._cat)
-            return await super().tag(settings)
-
-
-else:
-    # Keeps the module surface stable when EffING is absent, without teaching
-    # the type checker a second, incompatible definition of the class.
-    globals()["CatalogCardsPhase"] = None
-
-
-@hook(priority=10)
-def ingestion_phase_objects(cat=None, lizard=None) -> List[Any]:
-    """Contribute the ``CatalogCardsPhase`` instance to EffING's registry.
-
-    Import-safe: with EffING absent the class could not be defined and this
-    returns an empty list, leaving the legacy hooks as the only path.
-    """
-    if CatalogCardsPhase is None:
-        return []
-    return [CatalogCardsPhase(cat if cat is not None else lizard)]
-
-
-@hook(priority=10)
-async def before_rabbithole_splits_documents(docs: List[Document], cat) -> List[Document]:
-    if not docs:
-        return docs
-
-    # With the EffING phase machine active, the catalog_cards phase owns card
-    # generation: the in-memory TTL cache is no longer the persistence.
-    if await _phase_machine_active(cat):
-        return docs
-
-    text_docs = [doc for doc in docs if _is_llm_text_document(doc)]
-    metadata = (text_docs[0].metadata if text_docs else docs[0].metadata)
-    if 'source' not in metadata:
-        return docs
-
-    source = metadata['source'] 
-    agent_id = cat.agent_key
-    # chat_id is not added to metadata until store_documents(); fall back to
-    # cat.id (StrayCat) which is the conversation ID when available.
-    chat_id = metadata.get('chat_id') or getattr(cat, 'id', None)
-
-    cached_summary = CATALOGUES.get(agent_id, chat_id, source)
-    if cached_summary is not None:
-        log.info(f"cat_alog: cache hit for '{agent_id}/{chat_id}/{source}'")
-        return docs
-
-    settings = await cat.plugin_manager.get_plugin().load_settings()
-    settings = settings or {}
-    max_document_chars = int(settings.get("max_document_chars", 8000))
-    max_summary_words = int(settings.get("max_summary_words", 200))
-
-    # ONLY the parsed text chunks are summarized: image chunks (``[Image] …``
-    # placeholders), catalogue-card segments (a previous card's text) and any
-    # binary-looking content must never reach the summary LLM.
-    full_text = "\n\n".join(doc.page_content for doc in text_docs)
-    if not full_text.strip():
-        log.warning(
-            f"cat_alog: no readable text chunks for '{agent_id}/{chat_id}/{source}'; "
-            "skipping the summary (no LLM call)."
+    async def delete(self, source: IngestionSource, cat) -> None:
+        """Remove ONLY ``source``'s card points; idempotent and empty-safe."""
+        removed = await _delete_source_catalogue_cards(cat, source.name)
+        log.info(
+            f"cat_alog: phase catalog_cards deleted {removed} "
+            f"catalogue-card segment(s) for '{source.name}'"
         )
-        return docs
-    if len(full_text) > max_document_chars:
-        full_text = full_text[:max_document_chars] + ' [truncated] '
-
-    full_prompt = _build_summary_prompt(source, full_text, max_summary_words)
-
-    try:
-        summary = await _run_summary_agent(cat, full_prompt)
-    except Exception as e:
-        log.warning(f"cat_alog: failed to summarize '{agent_id}/{chat_id}/{source}': {e}")
-        summary = "(summary not available)"
-
-    CATALOGUES.set(agent_id, chat_id, source, summary)
-
-    log.info(f"cat_alog: summary added for '{agent_id}/{chat_id}/{source}' [{summary[:100]}...]")
-    return docs
 
 
 @hook(priority=10)
-async def before_rabbithole_stores_documents(docs: List[Document], cat) -> List[Document]:
+def rabbithole_ingestion_phases(phases: List, cat) -> List:
+    """Register the ``catalog_cards`` phase on the core ingestion protocol.
+
+    The hook receives and returns phase CLASSES (the host instantiates them
+    without arguments for every run), so the class is appended, never an
+    instance.
     """
-    Retrieve the pre-computed summary from the cat and append the catalogue card.
-    """
-    if not docs:
-        return docs
-
-    # With the EffING phase machine active, the catalog_cards phase owns card
-    # generation and persistence: this hook is a no-op.
-    if await _phase_machine_active(cat):
-        return docs
-
-    text_docs = [doc for doc in docs if _is_llm_text_document(doc)]
-    metadata = (text_docs[0].metadata if text_docs else docs[0].metadata)
-    if 'source' not in metadata:
-        return docs
-
-    # Add positional index to identify the first chunk (chunk_index=0)
-    # Only set if not already present (respects prior settings from chunker/plugins).
-    for i, doc in enumerate(docs):
-        doc.metadata.setdefault("chunk_index", i)
-
-    source = metadata['source']
-    agent_id = cat.agent_key
-    chat_id = metadata.get('chat_id') or getattr(cat, 'id', None)
-
-    summary = CATALOGUES.get(agent_id, chat_id, source)
-    if not summary:
-        log.warning(f"cat_alog: no summary found for {agent_id}/{chat_id}/{source}, skipping catalogue card.")
-        return docs
-
-    # The card's initial page is source TEXT, never an image placeholder, a
-    # previously built card, or decoded binary bytes.
-    abstract = text_docs[0].page_content.strip() if text_docs else ""
-    if not abstract:
-        log.warning(
-            f"cat_alog: no readable text chunks for {agent_id}/{chat_id}/{source}, "
-            "skipping catalogue card."
-        )
-        return docs
-
-    CATALOGUES.delete(agent_id, chat_id, source)
-
-    card, card_metadata = _build_catalogue_card(source, metadata, abstract, summary)
-
-    # Share the phase's deterministic card identity so a re-ingest or an
-    # engine switch targets the same card instead of adding a duplicate.
-    card_doc = Document(page_content=card, metadata=card_metadata)
-    card_doc.id = _catalogue_card_point_id(agent_id, chat_id, source)
-
-    log.debug(f"cat_alog: added catalogue card for '{source}'")
-    return docs + [card_doc]
+    phases = list(phases or [])
+    phases.append(CatalogCardsPhase)
+    return phases
 
 
 @tool(examples=[
@@ -1530,10 +1054,10 @@ async def _derived_image_files(cat) -> set:
 
 
 async def _collect_ingestion_sources(cat) -> Dict[str, Dict[str, Any]]:
-    """Phase-path file list: the agent's ingestion status rows are the sources.
+    """File list for the prompt suffix: the agent's ingestion status rows.
 
-    With the EffING phase machine active the status registry is the ground
-    truth of what has been ingested: one row per ingested SOURCE (file or URL),
+    The status registry is the ground truth of what has been ingested: one row
+    per ingested SOURCE (file or URL),
     AGENT scope. Rows only ever describe sources, so images extracted from a
     file have no row and cannot leak into the list; duplicates are impossible
     because the dict is keyed by source (a source without a catalogue card
@@ -1567,7 +1091,12 @@ async def _collect_ingestion_sources(cat) -> Dict[str, Dict[str, Any]]:
         if not isinstance(doc, dict):
             continue
         source = doc.get("source")
-        if not source or doc.get("scope") != "agent":
+        if not source:
+            continue
+        # The key encodes the scope: ``:ingestion:agent:<sha>`` for the agent
+        # knowledge base, ``:ingestion:chat:<chat_id>:<sha>`` for a chat. Only
+        # the agent-scoped sources belong to the prompt list.
+        if ":ingestion:chat:" in str(key):
             continue
         when = doc.get("updated_at") or doc.get("created_at")
         files[source] = {
@@ -1618,10 +1147,9 @@ async def agent_prompt_suffix(prompt_suffix: str, cat) -> str:
     """Append the list of files loaded in the agent and conversation to the end of the system prompt.
 
     ``append_file_list_to_prompt`` is the master switch: when it is False the
-    prompt is returned untouched and no file collection (no DB/vector query) is
-    performed. When it is True the list is status-first — the EffING phase path
-    builds it from the agent's ingestion-status rows, the classic path from the
-    FileManager + vector query collector. Derived images never appear in either.
+    prompt is returned untouched and no file collection (no DB query) is
+    performed. When it is True the list is built from the agent's ingestion
+    status rows, so it contains sources only: derived images never appear.
     """
     try:
         settings = await cat.plugin_manager.get_plugin().load_settings()
@@ -1633,10 +1161,7 @@ async def agent_prompt_suffix(prompt_suffix: str, cat) -> str:
         return prompt_suffix
 
     try:
-        if await _phase_machine_active(cat):
-            files = await _collect_ingestion_sources(cat)
-        else:
-            files = await _collect_loaded_files(cat)
+        files = await _collect_ingestion_sources(cat)
     except Exception as e:
         log.warning(f"cat_alog: agent_prompt_suffix could not collect loaded files: {e}")
         return prompt_suffix

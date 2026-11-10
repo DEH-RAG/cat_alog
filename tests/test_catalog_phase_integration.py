@@ -179,39 +179,97 @@ if __name__ == "__main__":
             assert type(plugin_manager).__name__ == "MadHatter"
             assert PLUGIN_ID in plugin_manager.plugins
 
-            splits_hook = _hook_function(plugin_manager, "before_rabbithole_splits_documents")
-            stores_hook = _hook_function(plugin_manager, "before_rabbithole_stores_documents")
-            cat_alog = sys.modules[splits_hook.__module__]
+            register_hook = _hook_function(plugin_manager, "rabbithole_ingestion_phases")
+            cat_alog = sys.modules[register_hook.__module__]
 
-            # Only the LLM is stubbed: the summary comes from the fake agentic workflow.
+            # Only the LLM is stubbed: settings, the vector store and the
+            # registration hook are the REAL host ones.
             cheshire_cat.agentic_workflow = _FakeSummaryWorkflow()
 
-            # Isolate the legacy before_rabbithole path; this test targets the
-            # plugin-manager resolution, not EffING's phase-machine gating.
-            async def _phase_path_inactive(cat=None):
-                return False
+            # (1) The core hook contributes the phase CLASS from this plugin.
+            registered = register_hook([], cheshire_cat)
+            assert registered == [cat_alog.CatalogCardsPhase], (
+                "the catalog phase was not registered through the real plugin manager: "
+                f"{registered}"
+            )
+            assert issubclass(registered[0], cat_alog.IngestionPhase)
 
-            original_phase = cat_alog._phase_machine_active
-            cat_alog._phase_machine_active = _phase_path_inactive
+            phase = registered[0]()
+
+            # (2) settings() resolves the plugin settings through the real manager
+            # (the `cat.mad_hatter` regression used to break this path).
+            settings = await phase.settings(cheshire_cat)
+            assert settings["max_document_chars"] == 8000
+            assert settings["max_summary_words"] == 200
+
+            source = cat_alog.IngestionSource(
+                agent_id=cheshire_cat.agent_key, chat_id=None, name="real.txt",
+            )
+            applies, reason = await phase.applies_to(source, cheshire_cat)
+            assert applies is True and reason is None
+
+            # (3) A real chunk in the real vector memory -> a real card.
+            from cat.services.memory.models import PointStruct, VectorMemoryType
+
+            collection = str(VectorMemoryType.DECLARATIVE)
+            handler = cheshire_cat.vector_memory_handler
+            # The agent already created its collections with the configured
+            # embedder: size the fake vectors to the real collection.
+            info = await handler._client.get_collection(collection)
+            vector = [0.01] * info.config.params.vectors.size
+            await handler.add_points_to_tenant(collection, points=[PointStruct(
+                id=uuid.uuid4().hex,
+                payload={
+                    "page_content": "hello world content",
+                    "metadata": {"source": "real.txt", "chunk_index": 0},
+                },
+                vector=vector,
+            )])
+
+            class _Embedder:
+                def _estimate_tokens(self, text):
+                    return 1
+
+                def embed_documents(self, texts):
+                    return [vector for _ in texts]
+
+            async def _embedder(cat):
+                return _Embedder()
+
+            original_embedder = cat_alog._resolve_embedder
+            cat_alog._resolve_embedder = _embedder
             try:
-                docs = [Document(page_content="hello world content", metadata={"source": "real.txt"})]
-
-                split_out = await splits_hook(docs, cheshire_cat)
-                assert split_out is docs
-                assert cat_alog.CATALOGUES.get(cheshire_cat.agent_key, None, "real.txt") == "FAKE SUMMARY"
-
-                stored_out = await stores_hook(docs, cheshire_cat)
-                cards = [doc for doc in stored_out if doc.metadata.get("is_catalogue_card") is True]
-
-                assert len(cards) == 1, (
-                    "no catalogue card produced through the real plugin manager: "
-                    f"{[doc.metadata for doc in stored_out]}"
-                )
-                assert isinstance(cards[0], Document)
-                assert "FAKE SUMMARY" in cards[0].page_content
-                assert "real.txt" in cards[0].page_content
+                result = await phase.process(source, cheshire_cat)
             finally:
-                cat_alog._phase_machine_active = original_phase
+                cat_alog._resolve_embedder = original_embedder
+
+            assert result.status == "done", f"phase did not complete: {result}"
+            records, _ = await handler.get_all_tenant_points(
+                collection,
+                metadata={"source": "real.txt", "is_catalogue_card": True},
+                with_vectors=False,
+            )
+            assert len(records) == 1, (
+                "no catalogue card produced through the real plugin manager: "
+                f"{records}"
+            )
+            payload = records[0].payload or {}
+            metadata = payload.get("metadata") or {}
+            assert "FAKE SUMMARY" in metadata.get("full_card", "")
+            assert "real.txt" in metadata.get("full_card", "")
+
+            # (4) delete() purges ONLY the source's card, never its chunk.
+            await phase.delete(source, cheshire_cat)
+            cards_after, _ = await handler.get_all_tenant_points(
+                collection,
+                metadata={"source": "real.txt", "is_catalogue_card": True},
+                with_vectors=False,
+            )
+            chunks_after, _ = await handler.get_all_tenant_points(
+                collection, metadata={"source": "real.txt"}, with_vectors=False,
+            )
+            assert cards_after == [], "delete must remove the source's cards"
+            assert len(chunks_after) == 1, "delete must not remove the source's chunk"
         finally:
             if mad_hatter_prop is not None:
                 setattr(ContextMixin, "mad_hatter", mad_hatter_prop)

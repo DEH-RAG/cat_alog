@@ -1,7 +1,12 @@
-"""Dual-mode, end-to-end proof of the CATALOG catalogue cards on the real app.
+"""End-to-end proof of the CATALOG catalogue cards on the real app.
 
-Moved out of the CAT core (tests/catalog/test_dual_mode.py) and owned by the
-cat_alog plugin itself, exactly like test_catalog_phase_integration.py.
+The catalogue card is produced by the ``catalog_cards`` phase of the CORE
+ingestion protocol (``cat.rabbit_hole.phases``): there is ONE ingestion path.
+This suite ingests a real corpus through the real app (``create_app`` +
+``LifespanManager``), against real host vector memory (in-memory Qdrant), a
+real local file manager, and the live Neo4j GraphRAG tenant, then asserts the
+phase built the card, its identity, segmentation, chat/tenant scoping, re-run
+behaviour and prompt listing.
 
 Standalone script (plugin rules): the host imports every ``.py`` under the
 plugin folder, so the ENTIRE body lives inside ``if __name__ == "__main__":``
@@ -22,27 +27,9 @@ Isolation
   tenant id (``catalog_dual_<uuid>``) and every node carrying that tenant is
   deleted in ``finally``. If Neo4j is unreachable the run FAILS explicitly
   (never skips silently).
-
-The same real corpus (``tests/mocks/sample.txt``) is ingested through both
-ingestion engines on the real app (``create_app`` + ``LifespanManager``):
-
-* **classic mode** — the system ``ingestion`` setting is the core engine, so the
-  cat_alog ``before_rabbithole_splits_documents`` / ``before_rabbithole_stores_documents``
-  hooks own the card;
-* **efficient mode** — the system ``ingestion`` setting is
-  ``EfficientIngestionConfiguration``, so the ``catalog_cards`` phase (declared
-  by cat_alog through the EffING phase contract) owns the card and the classic
-  hooks are never fired.
-
-The old pytest fixtures are inlined below (a standalone script cannot use
-fixtures): the plugin symlinks, the MyGRAPH link, the in-memory Qdrant double,
-the plugin-manager/background-task doubles and the real app boot all happen in
-``_scenario_env`` with the same setup/teardown semantics, except the Redis
-cleanup is scoped instead of a flush.
 """
 
 if __name__ == "__main__":
-
     import asyncio
     import functools
     import importlib
@@ -62,14 +49,6 @@ if __name__ == "__main__":
 
     #: The plugin root: this file lives in ``tests/`` after the move.
     REPO_ROOT = Path(__file__).resolve().parent.parent
-
-    # effing_testkit is published by the EffING plugin: the shared, import-safe
-    # doubles for the phase contract consumed by cat_alog. It now lives in the
-    # plugin's ``tests/`` directory.
-    _effing_dir = str(PLUGINS_ROOT / "cat-efficient-ingestion" / "tests")
-    if _effing_dir not in sys.path:
-        sys.path.insert(0, _effing_dir)
-    import effing_testkit
 
     # ---------------------------------------------------------------------------
     # Environment BEFORE importing cat (cat.startup builds an app at import time).
@@ -149,7 +128,6 @@ if __name__ == "__main__":
     CORE_PLUGINS_DIR = os.path.join("cat", "core_plugins")
     PLUGIN_LINKS = {
         "cat_alog": str(REPO_ROOT),
-        "cat_efficient_ingestion": str(PLUGINS_ROOT / "cat-efficient-ingestion"),
         "cat_multimodal_ingestion": str(PLUGINS_ROOT / "cat-multimodal-ingestion"),
     }
 
@@ -168,9 +146,6 @@ if __name__ == "__main__":
     SAMPLE_NAME = SAMPLE_FILE.name
     SAMPLE_CONTENT_TYPE = "text/plain"
     LONG_NAME = "long_catalog.txt"
-
-    CORE_ENGINE = "CoreIngestionConfiguration"
-    EFFICIENT_ENGINE = "EfficientIngestionConfiguration"
 
     DECLARATIVE = str(VectorMemoryType.DECLARATIVE)
     EPISODIC = str(VectorMemoryType.EPISODIC)
@@ -340,14 +315,6 @@ if __name__ == "__main__":
             # restore the real plugins folder so MyGRAPH is discovered by the app
             mp.setattr(utils, "get_plugins_path", lambda: str(PLUGINS_DIR))
 
-            # EffING contract (import-safe testkit): the dual-mode suite needs the
-            # REAL phase machine, so the canonical package must be importable here.
-            effing_mode = effing_testkit.install_stub_package()
-            assert effing_mode == "real", (
-                "the dual-mode suite needs the real cat_efficient_ingestion plugin importable, "
-                f"got effing_testkit mode={effing_mode!r}"
-            )
-
             os.environ["CAT_API_KEY"] = api_key
             os.environ["CAT_JWT_SECRET"] = jwt_secret
 
@@ -372,7 +339,6 @@ if __name__ == "__main__":
                 os.environ["CAT_JWT_SECRET"] = previous_jwt
             _remove_graph_link(created_graph)
             _remove_catalog_plugin_symlinks()
-            effing_testkit.uninstall_stub_package()
             _remove_storage_dirs()
             try:
                 await _reset_scoped_state()
@@ -570,14 +536,7 @@ if __name__ == "__main__":
         assert response.status_code == 200, response.text
 
 
-    async def _set_engine(client, agent_key: str, ingestion_name: str) -> None:
-        response = await client.put(
-            f"/ingestion/settings/{ingestion_name}", json={}, headers=_headers(agent_key),
-        )
-        assert response.status_code == 200, response.text
-
-
-    async def _configure_agent(client, agent_key: str, ingestion_name: str, graphrag: bool = False):
+    async def _configure_agent(client, agent_key: str, graphrag: bool = False):
         CREATED_AGENTS.add(agent_key)
 
         lizard = client._fastapi_test_app.state.lizard
@@ -589,7 +548,6 @@ if __name__ == "__main__":
                 await cat.plugin_manager.activate_plugin(PLUGIN_ID)
             assert PLUGIN_ID in cat.plugin_manager.active_plugins, cat.plugin_manager.active_plugins
             await _set_neo4j(client, agent_key)
-        await _set_engine(client, agent_key, ingestion_name)
         # the upstream default file manager is a no-op; the prompt list and the
         # oversized-card abstract need the real local storage
         await _set_file_manager(client, agent_key)
@@ -608,9 +566,10 @@ if __name__ == "__main__":
         return await _ingest(client, agent_key, SAMPLE_NAME, SAMPLE_FILE.read_bytes(), SAMPLE_CONTENT_TYPE, chat_id)
 
 
-    async def _status(agent_key: str, source: str = SAMPLE_NAME, scope: str = "agent") -> dict:
-        registry = importlib.import_module("cat.core_plugins.cat_efficient_ingestion.registry")
-        return await registry.get_status(agent_key, scope, source) or {}
+    async def _status(agent_key: str, source: str = SAMPLE_NAME, chat_id=None) -> dict:
+        from cat.db.cruds import ingestions as crud_ingestions
+
+        return await crud_ingestions.get_status(agent_key, chat_id, source) or {}
 
 
     # ---------------------------------------------------------------------------
@@ -680,62 +639,38 @@ if __name__ == "__main__":
         return importlib.import_module(hook.function.__module__)
 
 
-    def _install_card_hook_spy(plugin_manager, mp) -> dict:
-        """Count the cat_alog classic card work (test-only instrumentation).
+    def _install_phase_spy(cat, mp) -> dict:
+        """Count the ``catalog_cards`` phase runs (test-only instrumentation).
 
-        ``stores`` counts the hook that APPENDS the classic card; ``cache_writes``
-        counts the classic summary-cache writes (the only card work the splits hook
-        does). EffING's shared chunking step still invokes the splits hook, but with
-        the phase machine active it must be a no-op: no summary, no cache write.
+        The classic ingestion hooks no longer exist: the phase is the only card
+        producer, so exactly one run per source ingestion is expected.
         """
-        counts = {"splits": 0, "stores": 0, "cache_writes": 0}
-        wanted = {
-            "before_rabbithole_splits_documents": "splits",
-            "before_rabbithole_stores_documents": "stores",
-        }
+        counts = {"runs": 0}
+        cat_alog_module = _cat_alog_module(cat)
+        original = cat_alog_module.CatalogCardsPhase.process
 
-        def _wrap(key, original):
-            @functools.wraps(original)
-            async def wrapper(*args, **kwargs):
-                counts[key] += 1
-                return await original(*args, **kwargs)
+        @functools.wraps(original)
+        async def wrapper(self, source, phase_cat):
+            counts["runs"] += 1
+            return await original(self, source, phase_cat)
 
-            return wrapper
-
-        # resolve the plugin module through an untouched hook (the wrapped ones
-        # would report this test module as their __module__ after monkeypatching)
-        cat_alog_module = None
-        for hook in plugin_manager.plugins["cat_alog"].hooks:
-            if hook.name == "agent_prompt_suffix":
-                cat_alog_module = importlib.import_module(hook.function.__module__)
-                break
-
-        for name, key in wanted.items():
-            for hook in plugin_manager.hooks.get(name, []):
-                if hook.plugin_id == "cat_alog":
-                    mp.setattr(hook, "function", _wrap(key, hook.function))
-
-        assert cat_alog_module is not None, "cat_alog hooks not registered"
-        original_set = cat_alog_module.CATALOGUES.set
-
-        def _counting_set(*args, **kwargs):
-            counts["cache_writes"] += 1
-            return original_set(*args, **kwargs)
-
-        mp.setattr(cat_alog_module.CATALOGUES, "set", _counting_set)
-        assert counts == {"splits": 0, "stores": 0, "cache_writes": 0}
+        mp.setattr(cat_alog_module.CatalogCardsPhase, "process", wrapper)
+        for legacy in (
+            "before_rabbithole_splits_documents",
+            "before_rabbithole_stores_documents",
+        ):
+            assert not hasattr(cat_alog_module, legacy), legacy
         return counts
 
 
-
     # ---------------------------------------------------------------------------
-    # Scenario 1 — classic mode
+    # Scenario 1 — one card, ordered chunks, prompt listed once
     # ---------------------------------------------------------------------------
-    async def _scenario_classic_mode_one_card_ordered_next_and_prompt_once(client, agent_key, mp):
+    async def _scenario_one_card_ordered_next_and_prompt_once(client, agent_key, mp):
         await _assert_neo4j_reachable()
         try:
-            cat = await _configure_agent(client, agent_key, CORE_ENGINE, graphrag=True)
-            spy = _install_card_hook_spy(cat.plugin_manager, mp)
+            cat = await _configure_agent(client, agent_key, graphrag=True)
+            spy = _install_phase_spy(cat, mp)
 
             response = await _ingest_sample(client, agent_key)
             assert response.status_code == 200, response.text
@@ -757,8 +692,8 @@ if __name__ == "__main__":
             prompt = await _prompt_list(cat)
             assert prompt.count(SAMPLE_NAME) == 1, prompt
 
-            # classic mode owns the card through the two classic hooks, exactly once
-            assert spy == {"splits": 1, "stores": 1, "cache_writes": 1}, spy
+            # the core phase owns the card: exactly one run for the source
+            assert spy == {"runs": 1}, spy
 
             print("CLASSIC_CATALOG", {
                 "cards": len(cards), "chunks": len(chunks),
@@ -771,13 +706,13 @@ if __name__ == "__main__":
 
 
     # ---------------------------------------------------------------------------
-    # Scenario 2 — efficient mode
+    # Scenario 2 — the phase owns the card (no classic hooks)
     # ---------------------------------------------------------------------------
-    async def _scenario_efficient_mode_phase_builds_one_card_and_never_fires_classic_hooks(client, agent_key, mp):
+    async def _scenario_phase_builds_one_card_and_no_classic_hooks(client, agent_key, mp):
         await _assert_neo4j_reachable()
         try:
-            cat = await _configure_agent(client, agent_key, EFFICIENT_ENGINE, graphrag=True)
-            spy = _install_card_hook_spy(cat.plugin_manager, mp)
+            cat = await _configure_agent(client, agent_key, graphrag=True)
+            spy = _install_phase_spy(cat, mp)
 
             response = await _ingest_sample(client, agent_key)
             assert response.status_code == 200, response.text
@@ -791,11 +726,8 @@ if __name__ == "__main__":
             assert len(cards) == 1, [(_meta(c), c.id) for c in cards]
             assert _meta(cards[0])["is_catalogue_card"] is True
 
-            # the classic card work is inert: the phase owns the card. EffING emits
-            # the store hook once (both engines emit it exactly once per source),
-            # but the phase machine makes it a no-op: no card work and no summary
-            # cache write.
-            assert spy["stores"] == 1 and spy["cache_writes"] == 0, spy
+            # the core phase is the only card producer, exactly once per source
+            assert spy == {"runs": 1}, spy
 
             chunks = await _chunk_points(cat, DECLARATIVE, SAMPLE_NAME)
             assert len(chunks) >= 2, len(chunks)
@@ -820,7 +752,7 @@ if __name__ == "__main__":
     # ---------------------------------------------------------------------------
     async def _scenario_episodic_card_is_chat_scoped(client, agent_key, mp):
         chat = f"catalog_chat_{uuid.uuid4().hex[:8]}"
-        cat = await _configure_agent(client, agent_key, CORE_ENGINE)
+        cat = await _configure_agent(client, agent_key)
 
         response = await _ingest_sample(client, agent_key, chat_id=chat)
         assert response.status_code == 200, response.text
@@ -842,7 +774,7 @@ if __name__ == "__main__":
         # must be split into several segments (DumbEmbedder normally has no limit)
         mp.setattr(Embeddings, "max_input_tokens", 100)
 
-        cat = await _configure_agent(client, agent_key, EFFICIENT_ENGINE)
+        cat = await _configure_agent(client, agent_key)
         long_text = ("Alice was beginning to get very tired of sitting by her sister. " * 220).encode()
 
         response = await _ingest(client, agent_key, LONG_NAME, long_text)
@@ -861,10 +793,10 @@ if __name__ == "__main__":
 
 
     # ---------------------------------------------------------------------------
-    # Scenario 5 — engine switch: the card is regenerated, never duplicated
+    # Scenario 5 — re-ingest: the card is regenerated, never duplicated
     # ---------------------------------------------------------------------------
-    async def _scenario_engine_switch_regenerates_card_without_duplicating(client, agent_key, mp):
-        cat = await _configure_agent(client, agent_key, EFFICIENT_ENGINE)
+    async def _scenario_reingest_regenerates_card_without_duplicating(client, agent_key, mp):
+        cat = await _configure_agent(client, agent_key)
         response = await _ingest_sample(client, agent_key)
         assert response.status_code == 200, response.text
 
@@ -872,15 +804,18 @@ if __name__ == "__main__":
         assert len(first) == 1, [(_meta(c), c.id) for c in first]
         first_ids = {c.id for c in first}
 
-        # switch the SYSTEM ingestion engine to the core one and re-ingest
-        await _set_engine(client, agent_key, CORE_ENGINE)
-        spy = _install_card_hook_spy(cat.plugin_manager, mp)
+        # re-upload the SAME source: the phase runs again and must UPSERT the same
+        # deterministic id instead of adding a second card.
+        spy = _install_phase_spy(cat, mp)
         response = await _ingest_sample(client, agent_key)
         assert response.status_code == 200, response.text
-        assert spy == {"splits": 1, "stores": 1, "cache_writes": 1}, spy
+        assert spy == {"runs": 1}, spy
 
         second = await _card_points(cat, DECLARATIVE, SAMPLE_NAME)
         assert len(second) == 1, [(_meta(c), c.id) for c in second]
+        assert {c.id for c in second} == first_ids, (
+            first_ids, {c.id for c in second},
+        )
 
         print("SWITCH_CATALOG", {"first_ids": first_ids, "second_ids": {c.id for c in second}})
 
@@ -889,7 +824,7 @@ if __name__ == "__main__":
     # Scenario 6 — images extracted from a file never leak into the prompt list
     # ---------------------------------------------------------------------------
     async def _scenario_derived_image_file_is_excluded_from_prompt_list(client, agent_key, mp):
-        cat = await _configure_agent(client, agent_key, CORE_ENGINE)
+        cat = await _configure_agent(client, agent_key)
         response = await _ingest_sample(client, agent_key)
         assert response.status_code == 200, response.text
 
@@ -923,15 +858,15 @@ if __name__ == "__main__":
 
 
     # ---------------------------------------------------------------------------
-    # Scenario 6b — card id is tenant/chat scoped (B1) and survives a re-embed (B2)
+    # Scenario 6b — card id is tenant/chat scoped and survives a re-ingest
     # ---------------------------------------------------------------------------
     async def _scenario_same_source_in_two_agents_gets_distinct_card_ids(client, agent_key, mp):
         """The same file name uploaded to two agents must not collide (B1, phase)."""
         agent_a = f"catalog_dual_agents_a_{uuid.uuid4().hex[:8]}"
         agent_b = f"catalog_dual_agents_b_{uuid.uuid4().hex[:8]}"
 
-        cat_a = await _configure_agent(client, agent_a, EFFICIENT_ENGINE)
-        cat_b = await _configure_agent(client, agent_b, EFFICIENT_ENGINE)
+        cat_a = await _configure_agent(client, agent_a)
+        cat_b = await _configure_agent(client, agent_b)
 
         assert (await _ingest_sample(client, agent_a)).status_code == 200
         assert (await _ingest_sample(client, agent_b)).status_code == 200
@@ -950,7 +885,7 @@ if __name__ == "__main__":
 
     async def _scenario_same_source_in_two_chats_gets_distinct_card_ids(client, agent_key, mp):
         """Two chats of ONE agent get two distinct cards (B1, classic hooks)."""
-        cat = await _configure_agent(client, agent_key, CORE_ENGINE)
+        cat = await _configure_agent(client, agent_key)
         chat_1 = f"catalog_chat_{uuid.uuid4().hex[:8]}"
         chat_2 = f"catalog_chat_{uuid.uuid4().hex[:8]}"
 
@@ -966,48 +901,23 @@ if __name__ == "__main__":
         print("CHAT_SCOPED_CATALOG", by_chat)
 
 
-    async def _scenario_reembed_keeps_card_id_and_does_not_duplicate(client, agent_key, mp):
-        """A re-embed rebuild keeps the card id, so it never becomes a duplicate (B2)."""
-        from cat.core_plugins.cat_efficient_ingestion import reembed
-
-        cat = await _configure_agent(client, agent_key, EFFICIENT_ENGINE)
+    async def _scenario_reingest_keeps_card_id_and_does_not_duplicate(client, agent_key, mp):
+        """A re-ingest keeps the deterministic card id, so it never duplicates (B2)."""
+        cat = await _configure_agent(client, agent_key)
         assert (await _ingest_sample(client, agent_key)).status_code == 200
 
         cards = await _card_points(cat, DECLARATIVE, SAMPLE_NAME)
         assert len(cards) == 1, [(_meta(c), c.id) for c in cards]
         original_ids = {c.id for c in cards}
 
-        # Emulate the re-embed rebuild the embedding phase performs: it reconstructs
-        # every stored point of the source from its payload and re-stores it.
-        points = await _points(cat, DECLARATIVE, {"source": SAMPLE_NAME})
-        embedder = await cat.embedder()
-        rebuilt = await reembed._embed_phase(
-            cat, DECLARATIVE, SAMPLE_NAME, points, embedder, None, cat, rabbit_hole=None,
-        )
-        rebuilt_cards = [
-            p for p in rebuilt
-            if (p.payload or {}).get("metadata", {}).get("is_catalogue_card") is True
-        ]
-        assert len(rebuilt_cards) == 1, [(_meta(p), p.id) for p in rebuilt_cards]
-        assert {_norm_id(p.id) for p in rebuilt_cards} == {_norm_id(i) for i in original_ids}, (
-            "the re-embed rebuild lost the card id",
-            original_ids,
-            {p.id for p in rebuilt_cards},
-        )
-
-        # After an embedding change the catalog_cards phase is stale and re-runs: it
-        # must UPSERT the same id, never add a second card.
-        run_hook = next(
-            h for h in cat.plugin_manager.plugins["cat_alog"].hooks
-            if h.name == "ingestion_phase_run"
-        )
-        result = await run_hook.function("catalog_cards", SAMPLE_NAME, {}, cat)
-        assert result == {"status": "done"}, result
+        # Re-run EVERY phase from the kept bytes (the core replacement of the
+        # embedder-rebuild path): the catalogue phase must UPSERT the same id.
+        await cat.rabbit_hole.reingest_source(cat, SAMPLE_NAME)
 
         cards = await _card_points(cat, DECLARATIVE, SAMPLE_NAME)
         assert len(cards) == 1, [(_meta(c), c.id) for c in cards]
         assert {_norm_id(c.id) for c in cards} == {_norm_id(i) for i in original_ids}, (
-            "re-embed + phase re-run changed the card id",
+            "a re-ingest changed the card id",
             original_ids,
             {c.id for c in cards},
         )
@@ -1015,9 +925,9 @@ if __name__ == "__main__":
         print("REEMBED_CATALOG", {"cards": len(cards), "ids": sorted(original_ids)})
 
 
-    async def _scenario_same_source_in_two_chats_phase_mode_is_isolated(client, agent_key, mp):
+    async def _scenario_same_source_in_two_chats_are_isolated(client, agent_key, mp):
         """B1: the phase keeps two chats of one filename isolated (two cards)."""
-        cat = await _configure_agent(client, agent_key, EFFICIENT_ENGINE)
+        cat = await _configure_agent(client, agent_key)
         chat_1 = f"catalog_chat_{uuid.uuid4().hex[:8]}"
         chat_2 = f"catalog_chat_{uuid.uuid4().hex[:8]}"
         text_1 = ("alpha chat only " * 60).encode()
@@ -1059,13 +969,11 @@ if __name__ == "__main__":
         })
 
 
-    async def _scenario_reembed_keeps_oversized_card_ids(client, agent_key, mp):
-        """B2: a re-embed must not re-split the card, so count and ids stay stable."""
-        from cat.core_plugins.cat_efficient_ingestion import reembed
-
+    async def _scenario_reingest_keeps_oversized_card_ids(client, agent_key, mp):
+        """B2: a re-ingest at the SAME window keeps segment count and ids stable."""
         # test-only instrumentation: force the phase to segment the oversized card.
         mp.setattr(Embeddings, "max_input_tokens", 100)
-        cat = await _configure_agent(client, agent_key, EFFICIENT_ENGINE)
+        cat = await _configure_agent(client, agent_key)
         long_text = ("Alice was beginning to get very tired of sitting by her sister. " * 220).encode()
 
         assert (await _ingest(client, agent_key, LONG_NAME, long_text)).status_code == 200
@@ -1082,25 +990,17 @@ if __name__ == "__main__":
                 agent_key, None, LONG_NAME, start_index=meta["start_index"]
             ))
 
-        points = await _points(cat, DECLARATIVE, {"source": LONG_NAME})
-        embedder = await cat.embedder()
-        # A LOWER limit after the fact: without the card-segment exemption this
-        # re-split would mint a different segment count and new ids.
-        mp.setattr(embedder, "max_input_tokens", 20, raising=False)
-        rebuilt = await reembed._embed_phase(
-            cat, DECLARATIVE, LONG_NAME, points, embedder, None, cat, rabbit_hole=None,
-        )
-        rebuilt_cards = [
-            p for p in rebuilt
-            if (p.payload or {}).get("metadata", {}).get("is_catalogue_card") is True
-        ]
-        assert len(rebuilt_cards) == len(cards), [p.id for p in rebuilt_cards]
-        assert sorted(_norm_id(p.id) for p in rebuilt_cards) == sorted(
+        # Same embedder window -> same split -> same ids. A plain re-run must never
+        # accumulate a second set of segments.
+        await cat.rabbit_hole.reingest_source(cat, LONG_NAME)
+        cards = await _card_points(cat, DECLARATIVE, LONG_NAME)
+        assert len(cards) == len(original_ids), [p.id for p in cards]
+        assert sorted(_norm_id(c.id) for c in cards) == sorted(
             _norm_id(i) for i in original_ids
         ), (
-            "the re-embed re-split the card and lost its ids",
+            "a re-ingest re-split the card and lost its ids",
             original_ids,
-            sorted(p.id for p in rebuilt_cards),
+            sorted(c.id for c in cards),
         )
 
         print("REEMBED_OVERSIZED_CATALOG", {
@@ -1119,15 +1019,11 @@ if __name__ == "__main__":
         """
         from langchain_core.documents import Document
 
-        from cat.core_plugins.cat_efficient_ingestion.split import split_oversized
+        from cat.rabbit_hole.split import split_oversized
 
         mp.setattr(Embeddings, "max_input_tokens", 100)
-        cat = await _configure_agent(client, agent_key, EFFICIENT_ENGINE)
+        cat = await _configure_agent(client, agent_key)
         cat_alog = _cat_alog_module(cat)
-        run_hook = next(
-            h for h in cat.plugin_manager.plugins["cat_alog"].hooks
-            if h.name == "ingestion_phase_run"
-        )
 
         long_text = ("Alice was beginning to get very tired of sitting by her sister. " * 220).encode()
         other_name = "other_catalog.txt"
@@ -1167,7 +1063,9 @@ if __name__ == "__main__":
 
         def _expected_offsets(card_text, embedder):
             segments = split_oversized(
-                [Document(page_content=card_text, metadata={})], embedder,
+                [Document(page_content=card_text, metadata={})],
+                getattr(embedder, "max_input_tokens", None) or 0,
+                getattr(embedder, "_estimate_tokens", None),
             )
             normalized = " ".join(card_text.split())
             cursor = 0
@@ -1181,8 +1079,11 @@ if __name__ == "__main__":
             return offsets
 
         async def _run_and_check(expected_more_than=None, expected_count=None):
-            result = await run_hook.function("catalog_cards", LONG_NAME, {}, cat)
-            assert result == {"status": "done"}, result
+            phase_source = cat_alog.IngestionSource(
+                agent_id=agent_key, chat_id=None, name=LONG_NAME,
+            )
+            result = await cat_alog.CatalogCardsPhase().process(phase_source, cat)
+            assert result.status == "done", result
             agent_cards = await _write(DECLARATIVE)
             chat_cards = await _write(EPISODIC)
             assert {_meta(c).get("chat_id") for c in agent_cards} == {None}, (
@@ -1295,25 +1196,25 @@ if __name__ == "__main__":
 
 
     SCENARIOS = [
-        ("classic_mode_one_card_ordered_next_and_prompt_once",
-         _scenario_classic_mode_one_card_ordered_next_and_prompt_once),
-        ("efficient_mode_phase_builds_one_card_and_never_fires_classic_hooks",
-         _scenario_efficient_mode_phase_builds_one_card_and_never_fires_classic_hooks),
+        ("one_card_ordered_next_and_prompt_once",
+         _scenario_one_card_ordered_next_and_prompt_once),
+        ("phase_builds_one_card_and_no_classic_hooks",
+         _scenario_phase_builds_one_card_and_no_classic_hooks),
         ("episodic_card_is_chat_scoped", _scenario_episodic_card_is_chat_scoped),
         ("oversized_card_is_segmented_with_full_card", _scenario_oversized_card_is_segmented_with_full_card),
-        ("engine_switch_regenerates_card_without_duplicating",
-         _scenario_engine_switch_regenerates_card_without_duplicating),
+        ("reingest_regenerates_card_without_duplicating",
+         _scenario_reingest_regenerates_card_without_duplicating),
         ("derived_image_file_is_excluded_from_prompt_list",
          _scenario_derived_image_file_is_excluded_from_prompt_list),
         ("same_source_in_two_agents_gets_distinct_card_ids",
          _scenario_same_source_in_two_agents_gets_distinct_card_ids),
         ("same_source_in_two_chats_gets_distinct_card_ids",
          _scenario_same_source_in_two_chats_gets_distinct_card_ids),
-        ("reembed_keeps_card_id_and_does_not_duplicate",
-         _scenario_reembed_keeps_card_id_and_does_not_duplicate),
-        ("same_source_in_two_chats_phase_mode_is_isolated",
-         _scenario_same_source_in_two_chats_phase_mode_is_isolated),
-        ("reembed_keeps_oversized_card_ids", _scenario_reembed_keeps_oversized_card_ids),
+        ("reingest_keeps_card_id_and_does_not_duplicate",
+         _scenario_reingest_keeps_card_id_and_does_not_duplicate),
+        ("same_source_in_two_chats_are_isolated",
+         _scenario_same_source_in_two_chats_are_isolated),
+        ("reingest_keeps_oversized_card_ids", _scenario_reingest_keeps_oversized_card_ids),
         ("phase_replaces_segments_when_embedder_window_changes",
          _scenario_phase_replaces_segments_when_embedder_window_changes),
     ]
